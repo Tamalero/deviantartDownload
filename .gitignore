@@ -1,0 +1,12 @@
+config.ini
+secret.key
+__pycache__/
+*.pyc
+Downloads/
+Downloaded_images/
+*.AppImage
+*.AppImage.zsync
+*.AppDir/
+dist/
+build/
+*.spec

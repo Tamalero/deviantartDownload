@@ -1,0 +1,553 @@
+import html
+import sys
+from pathlib import Path
+
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget,
+    QVBoxLayout, QHBoxLayout, QFormLayout,
+    QGroupBox, QLabel, QLineEdit, QPushButton,
+    QComboBox, QSpinBox, QDoubleSpinBox, QFileDialog,
+    QTextEdit, QStatusBar, QProgressBar, QSplitter, QSizePolicy,
+    QMessageBox,
+)
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QUrl
+from PyQt6.QtGui import QFont, QPixmap, QDesktopServices
+
+import dadownload as da
+
+
+# ── Background worker ──────────────────────────────────────────────────────────
+
+class DownloadWorker(QThread):
+    log           = pyqtSignal(str)
+    error         = pyqtSignal(str)
+    done          = pyqtSignal(bool, str)
+    progress      = pyqtSignal(int, int)        # (done_count, total)
+    file_progress = pyqtSignal(str, int, int)   # (filename, bytes_done, bytes_total)
+    preview       = pyqtSignal(str)             # filepath
+
+    def __init__(self, cfg: dict):
+        super().__init__()
+        self.cfg   = cfg
+        self._stop = False
+
+    def cancel(self):
+        self._stop = True
+
+    def run(self):
+        cfg = self.cfg
+        try:
+            self.log.emit("Getting access token…")
+            token = da.get_access_token(cfg["client_id"], cfg["client_secret"])
+            self.log.emit("Authenticated.")
+
+            media_map  = {"Both": "both", "Images Only": "images", "Videos Only": "videos"}
+            media_type = media_map[cfg["media"]]
+
+            if cfg["mode"] == "User Gallery":
+                deviations = da.fetch_user_gallery(
+                    token, cfg["username"],
+                    max_pages=cfg["pages"],
+                    media_type=media_type,
+                    log_fn=self.log.emit,
+                )
+            else:
+                deviations = da.fetch_user_favourites(
+                    token, cfg["username"],
+                    max_pages=cfg["pages"],
+                    media_type=media_type,
+                    log_fn=self.log.emit,
+                )
+
+            stats = da.download_media(
+                deviations,
+                token,
+                cfg["output"],
+                media_type=media_type,
+                log_fn=self.log.emit,
+                error_fn=self.error.emit,
+                cancel_fn=lambda: self._stop,
+                progress_fn=lambda d, t: self.progress.emit(d, t),
+                file_progress_fn=lambda fn, d, t: self.file_progress.emit(fn, d, t),
+                preview_fn=self.preview.emit,
+                delay_min=cfg["delay_min"],
+                delay_max=cfg["delay_max"],
+            )
+
+            total_files = stats["images"] + stats["videos"]
+            nb          = stats["bytes"]
+            size_str    = (f"{nb / 1_048_576:.1f} MB" if nb >= 1_048_576
+                           else f"{nb / 1024:.1f} KB")
+            self.log.emit(
+                f"── Summary ──  Images: {stats['images']}  │  "
+                f"Videos: {stats['videos']}  │  "
+                f"Total: {total_files} files  │  {size_str}"
+            )
+
+            if self._stop:
+                self.done.emit(False, "Cancelled.")
+            else:
+                self.done.emit(True, f"Done — {total_files} files · {size_str}")
+
+        except Exception as e:
+            self.done.emit(False, str(e))
+
+
+# ── Main window ────────────────────────────────────────────────────────────────
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"DeviantArt Downloader v{da.VERSION}")
+        self.setMinimumWidth(640)
+        self.worker: DownloadWorker | None = None
+        self._current_preview_pixmap: QPixmap | None = None
+        self._build_ui()
+        self._load_saved_credentials()
+        self._load_ui_state()
+
+    # ── UI construction ────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        root = QWidget()
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+        layout.setSpacing(10)
+        layout.setContentsMargins(14, 14, 14, 14)
+
+        layout.addWidget(self._credentials_group())
+        layout.addWidget(self._options_group())
+        layout.addWidget(self._output_group())
+        layout.addLayout(self._buttons_row())
+        layout.addWidget(self._progress_group())
+
+        self._bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._bottom_splitter.setChildrenCollapsible(False)
+        self._bottom_splitter.addWidget(self._preview_group())
+        self._bottom_splitter.addWidget(self._log_group())
+        layout.addWidget(self._bottom_splitter, 1)
+
+        self.statusbar = QStatusBar()
+        self.setStatusBar(self.statusbar)
+        self.statusbar.showMessage("Ready")
+
+    def _credentials_group(self) -> QGroupBox:
+        g = QGroupBox("Credentials")
+        f = QFormLayout(g)
+        self.le_client_id     = QLineEdit(placeholderText="Client ID")
+        self.le_client_secret = QLineEdit(placeholderText="Client Secret")
+        self.le_client_secret.setEchoMode(QLineEdit.EchoMode.Password)
+        help_lbl = QLabel(
+            '<a href="https://www.deviantart.com/developers/">'
+            'Register an app at deviantart.com/developers</a>'
+        )
+        help_lbl.setOpenExternalLinks(True)
+        f.addRow("Client ID:", self.le_client_id)
+        f.addRow("Client Secret:", self.le_client_secret)
+        f.addRow("", help_lbl)
+        return g
+
+    def _options_group(self) -> QGroupBox:
+        g = QGroupBox("Download Options")
+        f = QFormLayout(g)
+
+        self.cb_mode = QComboBox()
+        self.cb_mode.addItems(["User Gallery", "User Favourites"])
+
+        self.le_username = QLineEdit(placeholderText="DeviantArt username to download from")
+
+        self.cb_media = QComboBox()
+        self.cb_media.addItems(["Both", "Images Only", "Videos Only"])
+
+        self.sp_pages = QSpinBox()
+        self.sp_pages.setRange(1, 200)
+        self.sp_pages.setValue(25)
+        self.sp_pages.setSuffix("  pages  (~24 deviations each)")
+
+        f.addRow("Mode:", self.cb_mode)
+        f.addRow("Username:", self.le_username)
+        f.addRow("Media Type:", self.cb_media)
+        f.addRow("Max Pages:", self.sp_pages)
+        f.addRow("Post Delay:", self._build_delay_widget())
+        return g
+
+    def _output_group(self) -> QGroupBox:
+        g = QGroupBox("Output Folder")
+        h = QHBoxLayout(g)
+        self.le_output = QLineEdit(da.DEFAULT_DOWNLOAD_DIR)
+        btn = QPushButton("Browse…")
+        btn.setFixedWidth(80)
+        btn.clicked.connect(self._browse_output)
+        h.addWidget(self.le_output)
+        h.addWidget(btn)
+        return g
+
+    def _buttons_row(self) -> QHBoxLayout:
+        h = QHBoxLayout()
+        self.btn_start  = QPushButton("Start Download")
+        self.btn_cancel = QPushButton("Cancel")
+        for btn in (self.btn_start, self.btn_cancel):
+            btn.setFixedHeight(34)
+        self.btn_cancel.setEnabled(False)
+        self.btn_start.clicked.connect(self._start)
+        self.btn_cancel.clicked.connect(self._cancel)
+        h.addWidget(self.btn_start)
+        h.addWidget(self.btn_cancel)
+        return h
+
+    def _progress_group(self) -> QGroupBox:
+        g = QGroupBox("Progress")
+        v = QVBoxLayout(g)
+        v.setSpacing(4)
+
+        h_overall = QHBoxLayout()
+        lbl_total = QLabel("Total:")
+        lbl_total.setFixedWidth(42)
+        self.pb_overall = QProgressBar()
+        self.pb_overall.setTextVisible(False)
+        self.pb_overall.setFixedHeight(16)
+        self.lbl_overall_count = QLabel("–")
+        self.lbl_overall_count.setFixedWidth(90)
+        self.lbl_overall_count.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        h_overall.addWidget(lbl_total)
+        h_overall.addWidget(self.pb_overall, 1)
+        h_overall.addWidget(self.lbl_overall_count)
+
+        h_current = QHBoxLayout()
+        lbl_file = QLabel("File:")
+        lbl_file.setFixedWidth(42)
+        self.pb_current = QProgressBar()
+        self.pb_current.setTextVisible(False)
+        self.pb_current.setFixedHeight(16)
+        h_current.addWidget(lbl_file)
+        h_current.addWidget(self.pb_current, 1)
+
+        self.lbl_current_file = QLabel("")
+        self.lbl_current_file.setFont(QFont("Monospace", 8))
+
+        v.addLayout(h_overall)
+        v.addLayout(h_current)
+        v.addWidget(self.lbl_current_file)
+        return g
+
+    def _preview_group(self) -> QGroupBox:
+        g = QGroupBox("Preview")
+        g.setMinimumWidth(150)
+        v = QVBoxLayout(g)
+        self.lbl_preview = QLabel("No preview")
+        self.lbl_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_preview.setMinimumSize(100, 150)
+        self.lbl_preview.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.lbl_preview.setStyleSheet(
+            "background-color: #1a1a2e; color: #666; border-radius: 4px;"
+        )
+        v.addWidget(self.lbl_preview)
+        return g
+
+    def _log_group(self) -> QGroupBox:
+        g = QGroupBox("Log")
+        v = QVBoxLayout(g)
+        self.te_log = QTextEdit()
+        self.te_log.setReadOnly(True)
+        self.te_log.setFont(QFont("Monospace", 9))
+        self.te_log.setMinimumHeight(160)
+        v.addWidget(self.te_log)
+        return g
+
+    # ── Window events ──────────────────────────────────────────────────────────
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._apply_splitter_ratio()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._rescale_preview()
+
+    def _apply_splitter_ratio(self):
+        screen   = QApplication.primaryScreen()
+        screen_h = screen.size().height() if screen else 1080
+
+        if screen_h <= 1080:
+            preview_ratio = 0.30
+            self._bottom_splitter.setStretchFactor(0, 3)
+            self._bottom_splitter.setStretchFactor(1, 7)
+        else:
+            preview_ratio = 0.50
+            self._bottom_splitter.setStretchFactor(0, 1)
+            self._bottom_splitter.setStretchFactor(1, 1)
+
+        total = self._bottom_splitter.width()
+        if total > 0:
+            preview_w = int(total * preview_ratio)
+            self._bottom_splitter.setSizes([preview_w, total - preview_w])
+
+    # ── Slots ──────────────────────────────────────────────────────────────────
+
+    def _build_delay_widget(self) -> QWidget:
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+
+        self.cb_delay_type = QComboBox()
+        self.cb_delay_type.addItems(["Fixed", "Variable"])
+        self.cb_delay_type.setFixedWidth(84)
+
+        self.dsb_delay_fixed = QDoubleSpinBox()
+        self.dsb_delay_fixed.setRange(0.0, 60.0)
+        self.dsb_delay_fixed.setSingleStep(0.1)
+        self.dsb_delay_fixed.setValue(1.0)
+        self.dsb_delay_fixed.setSuffix(" s")
+        self.dsb_delay_fixed.setFixedWidth(72)
+
+        self.dsb_delay_min = QDoubleSpinBox()
+        self.dsb_delay_min.setRange(0.0, 60.0)
+        self.dsb_delay_min.setSingleStep(0.1)
+        self.dsb_delay_min.setValue(0.5)
+        self.dsb_delay_min.setSuffix(" s")
+        self.dsb_delay_min.setFixedWidth(72)
+        self.dsb_delay_min.setVisible(False)
+
+        self._lbl_delay_to = QLabel("to")
+        self._lbl_delay_to.setVisible(False)
+
+        self.dsb_delay_max = QDoubleSpinBox()
+        self.dsb_delay_max.setRange(0.0, 60.0)
+        self.dsb_delay_max.setSingleStep(0.1)
+        self.dsb_delay_max.setValue(2.0)
+        self.dsb_delay_max.setSuffix(" s")
+        self.dsb_delay_max.setFixedWidth(72)
+        self.dsb_delay_max.setVisible(False)
+
+        h.addWidget(self.cb_delay_type)
+        h.addWidget(self.dsb_delay_fixed)
+        h.addWidget(self.dsb_delay_min)
+        h.addWidget(self._lbl_delay_to)
+        h.addWidget(self.dsb_delay_max)
+        h.addStretch()
+
+        self.cb_delay_type.currentTextChanged.connect(self._on_delay_type_changed)
+        return w
+
+    def _on_delay_type_changed(self, mode: str):
+        fixed = mode == "Fixed"
+        self.dsb_delay_fixed.setVisible(fixed)
+        self.dsb_delay_min.setVisible(not fixed)
+        self._lbl_delay_to.setVisible(not fixed)
+        self.dsb_delay_max.setVisible(not fixed)
+
+    def _browse_output(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Select Output Folder", self.le_output.text()
+        )
+        if path:
+            self.le_output.setText(path)
+
+    def _load_saved_credentials(self):
+        cfg = da.load_config()
+        if cfg.has_option("credentials", "client_id"):
+            self.le_client_id.setText(cfg.get("credentials", "client_id"))
+        if cfg.has_option("credentials", "client_secret"):
+            secret = da.get_client_secret(cfg)
+            if secret is not None:
+                self.le_client_secret.setText(secret)
+            else:
+                self.statusBar().showMessage(
+                    "Saved client secret could not be decrypted — please re-enter it.", 8000
+                )
+
+    def _load_ui_state(self):
+        cfg = da.load_config()
+        if not cfg.has_section("last_run"):
+            return
+        lr = cfg["last_run"]
+        if "mode" in lr:
+            idx = self.cb_mode.findText(lr["mode"])
+            if idx >= 0:
+                self.cb_mode.setCurrentIndex(idx)
+        if "username" in lr:
+            self.le_username.setText(lr["username"])
+        if "media" in lr:
+            idx = self.cb_media.findText(lr["media"])
+            if idx >= 0:
+                self.cb_media.setCurrentIndex(idx)
+        if "pages" in lr:
+            try:
+                self.sp_pages.setValue(int(lr["pages"]))
+            except ValueError:
+                pass
+        if "output" in lr:
+            self.le_output.setText(lr["output"])
+        if "delay_type" in lr:
+            idx = self.cb_delay_type.findText(lr["delay_type"])
+            if idx >= 0:
+                self.cb_delay_type.setCurrentIndex(idx)
+        for field, spinbox in [
+            ("delay_fixed", self.dsb_delay_fixed),
+            ("delay_min",   self.dsb_delay_min),
+            ("delay_max",   self.dsb_delay_max),
+        ]:
+            if field in lr:
+                try:
+                    spinbox.setValue(float(lr[field]))
+                except ValueError:
+                    pass
+
+    def _save_ui_state(self):
+        da.save_ui_state({
+            "mode":        self.cb_mode.currentText(),
+            "username":    self.le_username.text().strip(),
+            "media":       self.cb_media.currentText(),
+            "pages":       str(self.sp_pages.value()),
+            "output":      self.le_output.text().strip(),
+            "delay_type":  self.cb_delay_type.currentText(),
+            "delay_fixed": str(self.dsb_delay_fixed.value()),
+            "delay_min":   str(self.dsb_delay_min.value()),
+            "delay_max":   str(self.dsb_delay_max.value()),
+        })
+
+    def _append_log(self, msg: str):
+        self.te_log.append(html.escape(msg))
+        self._scroll_log()
+
+    def _append_error(self, msg: str):
+        self.te_log.append(
+            f'<span style="color: #ff5555;">{html.escape(msg)}</span>'
+        )
+        self._scroll_log()
+
+    def _scroll_log(self):
+        sb = self.te_log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _update_progress(self, done: int, total: int):
+        self.pb_overall.setMaximum(max(total, 1))
+        self.pb_overall.setValue(done)
+        self.lbl_overall_count.setText(f"{done} / {total} files")
+
+    def _update_file_progress(self, fname: str, done: int, total: int):
+        if total > 0:
+            self.pb_current.setMaximum(total)
+            self.pb_current.setValue(done)
+            if total >= 1_048_576:
+                size_str = f"{done / 1_048_576:.1f} / {total / 1_048_576:.1f} MB"
+            else:
+                size_str = f"{done / 1024:.1f} / {total / 1024:.1f} KB"
+            self.lbl_current_file.setText(f"{fname}  ({size_str})")
+        else:
+            self.pb_current.setMaximum(0)
+            self.pb_current.setValue(0)
+            self.lbl_current_file.setText(fname)
+
+    def _rescale_preview(self):
+        if self._current_preview_pixmap and not self._current_preview_pixmap.isNull():
+            size   = self.lbl_preview.size()
+            scaled = self._current_preview_pixmap.scaled(
+                size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.lbl_preview.setPixmap(scaled)
+
+    def _update_preview(self, filepath: str):
+        pixmap = QPixmap(filepath)
+        if not pixmap.isNull():
+            self._current_preview_pixmap = pixmap
+            self._rescale_preview()
+        else:
+            self._current_preview_pixmap = None
+            self.lbl_preview.setText("▶ Video")
+
+    def _start(self):
+        client_id     = self.le_client_id.text().strip()
+        client_secret = self.le_client_secret.text().strip()
+        username      = self.le_username.text().strip()
+
+        if not client_id or not client_secret:
+            self._append_error("Client ID and Client Secret are required.")
+            return
+        if not username:
+            self._append_error("Username is required.")
+            return
+
+        da.save_config(client_id, client_secret)
+        self._save_ui_state()
+
+        if self.cb_delay_type.currentText() == "Fixed":
+            d = self.dsb_delay_fixed.value()
+            delay_min, delay_max = d, d
+        else:
+            delay_min = self.dsb_delay_min.value()
+            delay_max = max(self.dsb_delay_max.value(), delay_min)
+
+        cfg = {
+            "client_id":     client_id,
+            "client_secret": client_secret,
+            "mode":          self.cb_mode.currentText(),
+            "username":      username,
+            "media":         self.cb_media.currentText(),
+            "pages":         self.sp_pages.value(),
+            "output":        self.le_output.text().strip(),
+            "delay_min":     delay_min,
+            "delay_max":     delay_max,
+        }
+
+        self.te_log.clear()
+        self.pb_overall.setMaximum(100)
+        self.pb_overall.setValue(0)
+        self.pb_current.setMaximum(100)
+        self.pb_current.setValue(0)
+        self.lbl_overall_count.setText("–")
+        self.lbl_current_file.setText("")
+        self._current_preview_pixmap = None
+        self.lbl_preview.setText("No preview")
+
+        self.btn_start.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self.statusbar.showMessage("Downloading…")
+
+        self.worker = DownloadWorker(cfg)
+        self.worker.log.connect(self._append_log)
+        self.worker.error.connect(self._append_error)
+        self.worker.done.connect(self._on_done)
+        self.worker.progress.connect(self._update_progress)
+        self.worker.file_progress.connect(self._update_file_progress)
+        self.worker.preview.connect(self._update_preview)
+        self.worker.start()
+
+    def _cancel(self):
+        if self.worker:
+            self.worker.cancel()
+        self.btn_cancel.setEnabled(False)
+        self.statusbar.showMessage("Cancelling…")
+
+    def _on_done(self, ok: bool, msg: str):
+        self.btn_start.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        if ok or msg == "Cancelled.":
+            self._append_log(msg)
+        else:
+            self._append_error(msg)
+        self.statusbar.showMessage(msg)
+        self.lbl_current_file.setText("")
+        self.pb_current.setMaximum(100)
+        self.pb_current.setValue(0)
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("DeviantArt Downloader")
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
