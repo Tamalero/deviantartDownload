@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QLabel, QLineEdit, QPushButton,
     QComboBox, QSpinBox, QDoubleSpinBox, QFileDialog,
     QTextEdit, QStatusBar, QProgressBar, QSplitter, QSizePolicy,
-    QMessageBox,
+    QMessageBox, QCheckBox,
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt, QUrl
 from PyQt6.QtGui import QFont, QPixmap, QDesktopServices
@@ -50,6 +50,7 @@ class DownloadWorker(QThread):
                     max_pages=cfg["pages"],
                     media_type=media_type,
                     log_fn=self.log.emit,
+                    verbose=cfg["verbose"],
                 )
             else:
                 deviations = da.fetch_user_favourites(
@@ -57,6 +58,7 @@ class DownloadWorker(QThread):
                     max_pages=cfg["pages"],
                     media_type=media_type,
                     log_fn=self.log.emit,
+                    verbose=cfg["verbose"],
                 )
 
             stats = da.download_media(
@@ -154,7 +156,7 @@ class MainWindow(QMainWindow):
         self.cb_mode = QComboBox()
         self.cb_mode.addItems(["User Gallery", "User Favourites"])
 
-        self.le_username = QLineEdit(placeholderText="DeviantArt username to download from")
+        self.le_username = QLineEdit(placeholderText="e.g.  tamalero  (username only, no URL)")
 
         self.cb_media = QComboBox()
         self.cb_media.addItems(["Both", "Images Only", "Videos Only"])
@@ -164,11 +166,14 @@ class MainWindow(QMainWindow):
         self.sp_pages.setValue(25)
         self.sp_pages.setSuffix("  pages  (~24 deviations each)")
 
+        self.chk_verbose = QCheckBox("Show detailed API output (for debugging)")
+
         f.addRow("Mode:", self.cb_mode)
         f.addRow("Username:", self.le_username)
         f.addRow("Media Type:", self.cb_media)
         f.addRow("Max Pages:", self.sp_pages)
         f.addRow("Post Delay:", self._build_delay_widget())
+        f.addRow("", self.chk_verbose)
         return g
 
     def _output_group(self) -> QGroupBox:
@@ -495,6 +500,7 @@ class MainWindow(QMainWindow):
             "output":        self.le_output.text().strip(),
             "delay_min":     delay_min,
             "delay_max":     delay_max,
+            "verbose":       self.chk_verbose.isChecked(),
         }
 
         self.te_log.clear()

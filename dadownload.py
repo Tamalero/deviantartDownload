@@ -141,7 +141,8 @@ def _image_ext_from_url(url: str) -> str:
 
 # ── Feed fetching ──────────────────────────────────────────────────────────────
 
-def _fetch_feed(url, token, username, max_pages, page_size, log_fn, media_type="both"):
+def _fetch_feed(url, token, username, max_pages, page_size, log_fn, media_type="both",
+                verbose=False):
     """Shared offset-based pagination loop for gallery and favourites endpoints."""
     headers = {"Authorization": f"Bearer {token}"}
     params_base = {
@@ -154,15 +155,43 @@ def _fetch_feed(url, token, username, max_pages, page_size, log_fn, media_type="
     offset = 0
     tty    = sys.stdout is not None and sys.stdout.isatty()
 
+    if verbose:
+        log_fn(f"[verbose] GET {url}")
+        log_fn(f"[verbose] base params: {params_base}")
+
     with tqdm(total=max_pages, desc="Scanning", unit="pg", disable=not tty) as pbar:
-        for _ in range(max_pages):
+        for page_num in range(max_pages):
             params = {**params_base, "offset": offset}
+            if verbose:
+                log_fn(f"[verbose] page {page_num + 1}: offset={offset}")
+
             resp = requests.get(url, headers=headers, params=params, timeout=15)
+
+            if verbose:
+                log_fn(f"[verbose] HTTP {resp.status_code}")
+
             resp.raise_for_status()
             data = resp.json()
 
+            if verbose:
+                top_keys = list(data.keys())
+                log_fn(f"[verbose] response keys: {top_keys}")
+                if "error" in data:
+                    log_fn(f"[verbose] API error: {data.get('error')} — {data.get('error_description', '')}")
+
             results = data.get("results", [])
+
+            if verbose:
+                type_counts: dict[str, int] = {}
+                for dev in results:
+                    t = dev.get("type", "unknown")
+                    type_counts[t] = type_counts.get(t, 0) + 1
+                log_fn(f"[verbose] page returned {len(results)} items — types: {type_counts}")
+                log_fn(f"[verbose] has_more={data.get('has_more')}  next_offset={data.get('next_offset')}")
+
             if not results:
+                if verbose:
+                    log_fn("[verbose] empty results — stopping pagination")
                 break
 
             for dev in results:
@@ -185,15 +214,17 @@ def _fetch_feed(url, token, username, max_pages, page_size, log_fn, media_type="
 
 
 def fetch_user_gallery(token, username, max_pages=25, page_size=24,
-                        log_fn=print, media_type="both"):
+                        log_fn=print, media_type="both", verbose=False):
     log_fn(f"Scanning gallery of {username}…")
-    return _fetch_feed(GALLERY_URL, token, username, max_pages, page_size, log_fn, media_type)
+    return _fetch_feed(GALLERY_URL, token, username, max_pages, page_size, log_fn, media_type,
+                       verbose=verbose)
 
 
 def fetch_user_favourites(token, username, max_pages=25, page_size=24,
-                           log_fn=print, media_type="both"):
+                           log_fn=print, media_type="both", verbose=False):
     log_fn(f"Scanning favourites of {username}…")
-    return _fetch_feed(FAVOURITES_URL, token, username, max_pages, page_size, log_fn, media_type)
+    return _fetch_feed(FAVOURITES_URL, token, username, max_pages, page_size, log_fn, media_type,
+                       verbose=verbose)
 
 
 # ── Download helpers ───────────────────────────────────────────────────────────
@@ -412,6 +443,8 @@ Register a DeviantArt app to get your client_id and client_secret:
                         help="DeviantArt client ID (override config)")
     parser.add_argument("--client-secret", metavar="SECRET",
                         help="DeviantArt client secret (override config)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Print detailed API request/response info for debugging")
     args = parser.parse_args()
 
     cfg           = load_config()
@@ -440,11 +473,13 @@ Register a DeviantArt app to get your client_id and client_secret:
 
     if args.mode == "gallery":
         items = fetch_user_gallery(
-            token, args.user, max_pages=args.pages, media_type=args.media
+            token, args.user, max_pages=args.pages, media_type=args.media,
+            verbose=args.verbose,
         )
     else:
         items = fetch_user_favourites(
-            token, args.user, max_pages=args.pages, media_type=args.media
+            token, args.user, max_pages=args.pages, media_type=args.media,
+            verbose=args.verbose,
         )
 
     print(f"Downloading {len(items)} deviations → {args.output}")
