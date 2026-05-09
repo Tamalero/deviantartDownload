@@ -74,6 +74,7 @@ class DownloadWorker(QThread):
                 preview_fn=self.preview.emit,
                 delay_min=cfg["delay_min"],
                 delay_max=cfg["delay_max"],
+                convert_webp=cfg.get("convert_webp"),
             )
 
             total_files = stats["images"] + stats["videos"]
@@ -263,11 +264,27 @@ class MainWindow(QMainWindow):
 
         self.chk_verbose = QCheckBox("Show detailed API output (for debugging)")
 
+        # WebP conversion row
+        self.chk_convert_webp = QCheckBox("Convert WebP to:")
+        self.cb_convert_webp_fmt = QComboBox()
+        self.cb_convert_webp_fmt.addItems(["PNG", "JPG"])
+        self.cb_convert_webp_fmt.setFixedWidth(68)
+        self.cb_convert_webp_fmt.setEnabled(False)
+        self.chk_convert_webp.toggled.connect(self.cb_convert_webp_fmt.setEnabled)
+        webp_row = QWidget()
+        webp_h = QHBoxLayout(webp_row)
+        webp_h.setContentsMargins(0, 0, 0, 0)
+        webp_h.setSpacing(6)
+        webp_h.addWidget(self.chk_convert_webp)
+        webp_h.addWidget(self.cb_convert_webp_fmt)
+        webp_h.addStretch()
+
         f.addRow("Mode:", self.cb_mode)
         f.addRow("Username:", self.le_username)
         f.addRow("Media Type:", self.cb_media)
         f.addRow("Max Pages:", self.sp_pages)
         f.addRow("Post Delay:", self._build_delay_widget())
+        f.addRow("WebP images:", webp_row)
         f.addRow("", self.chk_verbose)
         return g
 
@@ -595,18 +612,26 @@ class MainWindow(QMainWindow):
                     spinbox.setValue(float(lr[field]))
                 except ValueError:
                     pass
+        if "convert_webp" in lr:
+            self.chk_convert_webp.setChecked(lr["convert_webp"].lower() == "true")
+        if "convert_webp_fmt" in lr:
+            idx = self.cb_convert_webp_fmt.findText(lr["convert_webp_fmt"])
+            if idx >= 0:
+                self.cb_convert_webp_fmt.setCurrentIndex(idx)
 
     def _save_ui_state(self):
         da.save_ui_state({
-            "mode":        self.cb_mode.currentText(),
-            "username":    self.le_username.text().strip(),
-            "media":       self.cb_media.currentText(),
-            "pages":       str(self.sp_pages.value()),
-            "output":      self.le_output.text().strip(),
-            "delay_type":  self.cb_delay_type.currentText(),
-            "delay_fixed": str(self.dsb_delay_fixed.value()),
-            "delay_min":   str(self.dsb_delay_min.value()),
-            "delay_max":   str(self.dsb_delay_max.value()),
+            "mode":               self.cb_mode.currentText(),
+            "username":           self.le_username.text().strip(),
+            "media":              self.cb_media.currentText(),
+            "pages":              str(self.sp_pages.value()),
+            "output":             self.le_output.text().strip(),
+            "delay_type":         self.cb_delay_type.currentText(),
+            "delay_fixed":        str(self.dsb_delay_fixed.value()),
+            "delay_min":          str(self.dsb_delay_min.value()),
+            "delay_max":          str(self.dsb_delay_max.value()),
+            "convert_webp":       str(self.chk_convert_webp.isChecked()),
+            "convert_webp_fmt":   self.cb_convert_webp_fmt.currentText(),
         })
 
     def _append_log(self, msg: str):
@@ -718,6 +743,8 @@ class MainWindow(QMainWindow):
             "delay_min":     delay_min,
             "delay_max":     delay_max,
             "verbose":       self.chk_verbose.isChecked(),
+            "convert_webp":  (self.cb_convert_webp_fmt.currentText().lower()
+                              if self.chk_convert_webp.isChecked() else None),
         }
 
         self.te_log.clear()

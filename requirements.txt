@@ -3,3 +3,4 @@ tqdm
 PyQt6
 cryptography
 yt-dlp
+Pillow

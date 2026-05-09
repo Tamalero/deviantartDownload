@@ -12,7 +12,7 @@ import requests
 from tqdm import tqdm
 from cryptography.fernet import Fernet, InvalidToken
 
-VERSION     = "1.1.0"
+VERSION     = "1.2.0"
 GITHUB_REPO = "Tamalero/deviantartDownload"
 _GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -332,6 +332,23 @@ def _image_ext_from_url(url: str) -> str:
     return "jpg"
 
 
+def _convert_image(src_path: str, target_ext: str) -> str | None:
+    """Convert src_path to target_ext ('png' or 'jpg') using Pillow.
+    Returns the new file path on success, or None if Pillow is unavailable or conversion fails.
+    The caller is responsible for deleting the original file."""
+    try:
+        from PIL import Image
+        img = Image.open(src_path)
+        if target_ext == "jpg" and img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGB")
+        new_path = src_path.rsplit(".", 1)[0] + "." + target_ext
+        img.save(new_path, "JPEG" if target_ext == "jpg" else "PNG",
+                 quality=95 if target_ext == "jpg" else None)
+        return new_path
+    except Exception:
+        return None
+
+
 def _best_video_url(videos: list) -> tuple[str, int] | None:
     """Return (url, filesize) for the highest-quality entry in the deviation videos array.
 
@@ -488,11 +505,12 @@ def _download_video(url: str, output_template: str):
 def download_media(deviations, token, download_dir, media_type="both",
                    log_fn=print, error_fn=None, cancel_fn=None,
                    progress_fn=None, file_progress_fn=None, preview_fn=None,
-                   delay_min=0.5, delay_max=2.0):
+                   delay_min=0.5, delay_max=2.0, convert_webp=None):
     """
     Download images and/or videos from a list of deviation objects.
 
     media_type:       "images" | "videos" | "both"
+    convert_webp:     None | "png" | "jpg" — convert WebP images after download (requires Pillow)
     error_fn:         called for per-file errors; defaults to log_fn
     cancel_fn:        optional callable; stops when it returns True
     progress_fn:      called with (done_count, total_count) after each file
@@ -579,7 +597,18 @@ def download_media(deviations, token, download_dir, media_type="both",
                             downloaded_bytes += len(chunk)
                             if file_progress_fn:
                                 file_progress_fn(fname, downloaded_bytes, total_size)
-                log_fn(f"Saved image: {fname}")
+                if convert_webp and ext == "webp":
+                    new_path = _convert_image(fpath, convert_webp)
+                    if new_path:
+                        os.remove(fpath)
+                        fpath = new_path
+                        fname = os.path.basename(fpath)
+                        downloaded_bytes = os.path.getsize(fpath)
+                        log_fn(f"Saved image (converted to {convert_webp.upper()}): {fname}")
+                    else:
+                        log_fn(f"Saved image (WebP conversion failed — Pillow missing?): {fname}")
+                else:
+                    log_fn(f"Saved image: {fname}")
                 images_ok   += 1
                 bytes_total += downloaded_bytes
                 done_count  += 1

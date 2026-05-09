@@ -61,8 +61,6 @@ python3 -m PyInstaller \
     --exclude-module pandas \
     --exclude-module matplotlib \
     --exclude-module sympy \
-    --exclude-module PIL \
-    --exclude-module Pillow \
     --exclude-module sklearn \
     --exclude-module tensorflow \
     --exclude-module keras \
