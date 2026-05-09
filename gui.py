@@ -1,5 +1,6 @@
 import html
 import sys
+import time
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -10,13 +11,13 @@ from PyQt6.QtWidgets import (
     QTextEdit, QStatusBar, QProgressBar, QSplitter, QSizePolicy,
     QMessageBox, QCheckBox,
 )
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QUrl
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer, QUrl
 from PyQt6.QtGui import QFont, QPixmap, QDesktopServices
 
 import dadownload as da
 
 
-# ── Background worker ──────────────────────────────────────────────────────────
+# ── Background download worker ─────────────────────────────────────────────────
 
 class DownloadWorker(QThread):
     log           = pyqtSignal(str)
@@ -37,8 +38,7 @@ class DownloadWorker(QThread):
     def run(self):
         cfg = self.cfg
         try:
-            self.log.emit("Getting access token…")
-            token = da.get_access_token(cfg["client_id"], cfg["client_secret"])
+            token = cfg["access_token"]
             self.log.emit("Authenticated.")
 
             media_map  = {"Both": "both", "Images Only": "images", "Videos Only": "videos"}
@@ -95,6 +95,30 @@ class DownloadWorker(QThread):
             self.done.emit(False, str(e))
 
 
+# ── Authorization worker ───────────────────────────────────────────────────────
+
+class AuthWorker(QThread):
+    authorized = pyqtSignal(int)   # expires_at (unix timestamp)
+    auth_error = pyqtSignal(str)
+    log        = pyqtSignal(str)
+
+    def __init__(self, client_id: str, client_secret: str):
+        super().__init__()
+        self.client_id     = client_id
+        self.client_secret = client_secret
+
+    def run(self):
+        try:
+            token_data = da.get_access_token_auth_code(
+                self.client_id, self.client_secret, log_fn=self.log.emit
+            )
+            da.save_token(token_data)
+            expires_at = int(time.time()) + int(token_data.get("expires_in", 3600)) - 60
+            self.authorized.emit(expires_at)
+        except Exception as e:
+            self.auth_error.emit(str(e))
+
+
 # ── Update checker ─────────────────────────────────────────────────────────────
 
 class UpdateChecker(QThread):
@@ -118,13 +142,22 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"DeviantArt Downloader v{da.VERSION}")
         self.setMinimumWidth(640)
-        self.worker: DownloadWorker | None = None
+        self.worker: DownloadWorker | None  = None
         self._current_preview_pixmap: QPixmap | None = None
         self._update_checker: UpdateChecker | None = None
         self._manual_checker: UpdateChecker | None = None
+        self._auth_worker:    AuthWorker    | None = None
+        self._token_expires_at: int  = 0
+        self._authorizing:      bool = False
         self._build_ui()
         self._load_saved_credentials()
         self._load_ui_state()
+
+        # Countdown timer — ticks every 10 s, updates the auth status label
+        self._auth_timer = QTimer(self)
+        self._auth_timer.setInterval(10_000)
+        self._auth_timer.timeout.connect(self._tick_auth_status)
+        self._auth_timer.start()
 
     # ── UI construction ────────────────────────────────────────────────────────
 
@@ -173,18 +206,42 @@ class MainWindow(QMainWindow):
 
     def _credentials_group(self) -> QGroupBox:
         g = QGroupBox("Credentials")
-        f = QFormLayout(g)
-        self.le_client_id     = QLineEdit(placeholderText="Client ID")
-        self.le_client_secret = QLineEdit(placeholderText="Client Secret")
-        self.le_client_secret.setEchoMode(QLineEdit.EchoMode.Password)
-        help_lbl = QLabel(
-            '<a href="https://www.deviantart.com/developers/">'
-            'Register an app at deviantart.com/developers</a>'
+        outer = QVBoxLayout(g)
+        outer.setSpacing(8)
+
+        info = QLabel(
+            "<b>One-time setup required to download galleries:</b><br>"
+            "① Register a <b>Confidential</b> app at "
+            '<a href="https://www.deviantart.com/developers/">deviantart.com/developers</a> '
+            "— add <code>http://localhost:8765/callback</code> to the Redirect URI whitelist.<br>"
+            "② Enter the Client ID and Secret below, then click <b>Authorize</b>.<br>"
+            "&nbsp;&nbsp;&nbsp;A browser window will open for a one-time login with your DeviantArt account.<br>"
+            "③ <b>Mature content:</b> to download mature-rated images your DeviantArt account "
+            "must have mature content viewing <b>enabled</b> and be <b>age-verified</b> "
+            "in your DA account settings."
         )
-        help_lbl.setOpenExternalLinks(True)
+        info.setWordWrap(True)
+        info.setOpenExternalLinks(True)
+        info.setStyleSheet("color: #bbbbbb; font-size: 11px; padding: 2px 0px;")
+        outer.addWidget(info)
+
+        f = QFormLayout()
+        f.setContentsMargins(0, 4, 0, 0)
+        self.le_client_id     = QLineEdit(placeholderText="Numeric ID (from deviantart.com/developers)")
+        self.le_client_secret = QLineEdit(placeholderText="Hex secret — copy it right after registration")
+        self.le_client_secret.setEchoMode(QLineEdit.EchoMode.Password)
+
+        self._lbl_auth_status = QLabel("Not authorized")
+        self._lbl_auth_status.setStyleSheet("color: #ff5555;")
+
+        self._btn_authorize = QPushButton("Authorize with DeviantArt…")
+        self._btn_authorize.clicked.connect(self._authorize)
+
         f.addRow("Client ID:", self.le_client_id)
         f.addRow("Client Secret:", self.le_client_secret)
-        f.addRow("", help_lbl)
+        f.addRow("Auth status:", self._lbl_auth_status)
+        f.addRow("", self._btn_authorize)
+        outer.addLayout(f)
         return g
 
     def _options_group(self) -> QGroupBox:
@@ -364,6 +421,69 @@ class MainWindow(QMainWindow):
             f"github.com/{da.GITHUB_REPO}</a>",
         )
 
+    def _authorize(self):
+        client_id     = self.le_client_id.text().strip()
+        client_secret = self.le_client_secret.text().strip()
+        if not client_id or not client_secret:
+            self._append_error("Client ID and Client Secret are required before authorizing.")
+            return
+
+        da.save_config(client_id, client_secret)
+
+        self._authorizing = True
+        self._btn_authorize.setEnabled(False)
+        self._lbl_auth_status.setText("Authorizing… (check your browser)")
+        self._lbl_auth_status.setStyleSheet("color: #f8f8a0;")
+        self.statusbar.showMessage("Waiting for browser authorization…")
+
+        self._auth_worker = AuthWorker(client_id, client_secret)
+        self._auth_worker.log.connect(self._append_log)
+        self._auth_worker.authorized.connect(self._on_authorized)
+        self._auth_worker.auth_error.connect(self._on_auth_error)
+        self._auth_worker.start()
+
+    def _on_authorized(self, expires_at: int):
+        self._authorizing = False
+        self._btn_authorize.setEnabled(True)
+        self._update_auth_status(expires_at)
+        self.statusbar.showMessage("Authorized successfully.", 5000)
+
+    def _on_auth_error(self, msg: str):
+        self._authorizing = False
+        self._btn_authorize.setEnabled(True)
+        self._lbl_auth_status.setText("Authorization failed")
+        self._lbl_auth_status.setStyleSheet("color: #ff5555;")
+        self._append_error(f"Authorization failed: {msg}")
+        self.statusbar.showMessage("Authorization failed.", 5000)
+
+    def _tick_auth_status(self):
+        """Called every 10 s by the countdown timer; no-op while authorizing or never authorized."""
+        if not self._authorizing and self._token_expires_at > 0:
+            self._update_auth_status(self._token_expires_at)
+
+    def _update_auth_status(self, expires_at: int):
+        self._token_expires_at = expires_at
+        remaining = expires_at - int(time.time())
+        if remaining > 900:       # > 15 min — green
+            mins  = remaining // 60
+            text  = f"Authorized · expires in {mins} min"
+            color = "#05cc47"
+        elif remaining > 300:     # 5–15 min — yellow
+            mins  = remaining // 60
+            text  = f"Authorized · expires in {mins} min"
+            color = "#f8c800"
+        elif remaining > 0:       # < 5 min — red, show mm:ss
+            mins  = remaining // 60
+            secs  = remaining % 60
+            text  = (f"Authorized · expires in {mins}m {secs:02d}s"
+                     if mins else f"Authorized · expires in {secs}s")
+            color = "#ff5555"
+        else:                     # expired — orange, actionable
+            text  = "Token expired — click Authorize to re-authorize"
+            color = "#ff9900"
+        self._lbl_auth_status.setText(text)
+        self._lbl_auth_status.setStyleSheet(f"color: {color};")
+
     def _build_delay_widget(self) -> QWidget:
         w = QWidget()
         h = QHBoxLayout(w)
@@ -436,6 +556,8 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(
                     "Saved client secret could not be decrypted — please re-enter it.", 8000
                 )
+        _, _, expires_at = da.load_token(cfg)
+        self._update_auth_status(expires_at)
 
     def _load_ui_state(self):
         cfg = da.load_config()
@@ -551,6 +673,29 @@ class MainWindow(QMainWindow):
             self._append_error("Username is required.")
             return
 
+        # Resolve a valid access token — refresh inline if expired, else ask to authorize
+        cfg_data                            = da.load_config()
+        access_token, refresh_token, expires_at = da.load_token(cfg_data)
+
+        if access_token and time.time() < expires_at:
+            token = access_token
+        elif refresh_token:
+            self.statusbar.showMessage("Refreshing token…")
+            try:
+                token_data = da.refresh_access_token(client_id, client_secret, refresh_token)
+                da.save_token(token_data)
+                token   = token_data["access_token"]
+                new_exp = int(time.time()) + int(token_data.get("expires_in", 3600)) - 60
+                self._update_auth_status(new_exp)
+            except Exception as e:
+                self._append_error(f"Token refresh failed: {e} — please re-authorize.")
+                return
+        else:
+            self._append_error(
+                'Not authorized. Click "Authorize with DeviantArt…" first.'
+            )
+            return
+
         da.save_config(client_id, client_secret)
         self._save_ui_state()
 
@@ -564,6 +709,7 @@ class MainWindow(QMainWindow):
         cfg = {
             "client_id":     client_id,
             "client_secret": client_secret,
+            "access_token":  token,
             "mode":          self.cb_mode.currentText(),
             "username":      username,
             "media":         self.cb_media.currentText(),

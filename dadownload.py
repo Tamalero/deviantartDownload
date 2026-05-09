@@ -12,7 +12,7 @@ import requests
 from tqdm import tqdm
 from cryptography.fernet import Fernet, InvalidToken
 
-VERSION     = "1.0.0"
+VERSION     = "1.1.0"
 GITHUB_REPO = "Tamalero/deviantartDownload"
 _GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -30,6 +30,8 @@ API_BASE       = f"{_DA_BASE}/api/v1/oauth2"
 GALLERY_URL    = f"{API_BASE}/gallery/all"
 FAVOURITES_URL = f"{API_BASE}/collections/all"
 DOWNLOAD_URL   = f"{API_BASE}/deviation/download"
+AUTH_URL       = f"{_DA_BASE}/oauth2/authorize"
+REDIRECT_PORT  = 8765   # add http://localhost:8765 to your DA app's redirect URI whitelist
 
 
 # ── Config helpers ─────────────────────────────────────────────────────────────
@@ -118,6 +120,158 @@ def get_access_token(client_id: str, client_secret: str) -> str:
     return data["access_token"]
 
 
+def get_access_token_auth_code(
+    client_id: str, client_secret: str,
+    port: int = REDIRECT_PORT, log_fn=print,
+) -> dict:
+    """OAuth2 Authorization Code flow — opens browser, catches redirect, returns full token dict.
+
+    Requires http://localhost:{port} in your DA app's redirect URI whitelist (default: 8765).
+    The authenticated DA account must have mature content viewing enabled and be age-verified.
+    """
+    import base64
+    import hashlib
+    import os as _os
+    import urllib.parse
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    redirect_uri   = f"http://localhost:{port}/callback"
+    state          = _os.urandom(8).hex()
+    code_verifier  = base64.urlsafe_b64encode(_os.urandom(32)).rstrip(b"=").decode()
+    code_challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+
+    auth_params = urllib.parse.urlencode({
+        "response_type":         "code",
+        "client_id":             client_id,
+        "redirect_uri":          redirect_uri,
+        "scope":                 "browse",
+        "state":                 state,
+        "code_challenge":        code_challenge,
+        "code_challenge_method": "S256",
+    })
+    auth_url = f"{AUTH_URL}?{auth_params}"
+    result: dict[str, str | None] = {"code": None, "error": None}
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            if "code" in qs:
+                result["code"] = qs["code"][0]
+                body   = b"<html><body><h2>Authorized!</h2><p>You can close this tab.</p></body></html>"
+                status = 200
+            else:
+                result["error"] = qs.get("error", ["unknown"])[0]
+                body   = b"<html><body><h2>Authorization failed.</h2><p>You can close this tab.</p></body></html>"
+                status = 400
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            pass
+
+    server         = HTTPServer(("localhost", port), _Handler)
+    server.timeout = 120
+
+    log_fn("Opening DeviantArt authorization page in your browser…")
+    log_fn(f"(If it doesn't open automatically, visit: {auth_url})")
+    webbrowser.open(auth_url)
+    log_fn("Waiting for authorization (120 s timeout)…")
+
+    server.handle_request()
+    server.server_close()
+
+    if result["error"]:
+        raise RuntimeError(f"Authorization denied: {result['error']}")
+    if not result["code"]:
+        raise RuntimeError("Authorization timed out — no code received within 120 s.")
+
+    resp = requests.post(TOKEN_URL, data={
+        "grant_type":    "authorization_code",
+        "client_id":     client_id,
+        "client_secret": client_secret,
+        "code":          result["code"],
+        "redirect_uri":  redirect_uri,
+        "code_verifier": code_verifier,
+    }, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(f"Token exchange failed: {data.get('error_description', data['error'])}")
+    return data
+
+
+def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> dict:
+    """Exchange a refresh token for a new access token."""
+    resp = requests.post(TOKEN_URL, data={
+        "grant_type":    "refresh_token",
+        "client_id":     client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+    }, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if "error" in data:
+        raise RuntimeError(f"Token refresh failed: {data.get('error_description', data['error'])}")
+    return data
+
+
+def save_token(token_data: dict):
+    """Persist access_token, refresh_token, and expiry to config (Fernet-encrypted)."""
+    cfg = load_config()
+    if not cfg.has_section("credentials"):
+        cfg.add_section("credentials")
+    cfg.set("credentials", "access_token", encrypt_password(token_data["access_token"]))
+    if "refresh_token" in token_data:
+        cfg.set("credentials", "refresh_token", encrypt_password(token_data["refresh_token"]))
+    expires_at = int(time.time()) + int(token_data.get("expires_in", 3600)) - 60
+    cfg.set("credentials", "token_expires_at", str(expires_at))
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        cfg.write(f)
+
+
+def load_token(cfg) -> tuple[str | None, str | None, int]:
+    """Return (access_token, refresh_token, expires_at) from a loaded config."""
+    access_raw  = cfg.get("credentials", "access_token",      fallback=None)
+    refresh_raw = cfg.get("credentials", "refresh_token",     fallback=None)
+    expires_at  = int(cfg.get("credentials", "token_expires_at", fallback="0") or "0")
+    return (
+        decrypt_password(access_raw)  if access_raw  else None,
+        decrypt_password(refresh_raw) if refresh_raw else None,
+        expires_at,
+    )
+
+
+def get_or_refresh_token(client_id: str, client_secret: str, log_fn=print) -> str:
+    """Return a valid access token for CLI use — refreshes or re-authorizes via browser as needed."""
+    cfg = load_config()
+    access_token, refresh_token, expires_at = load_token(cfg)
+
+    if access_token and time.time() < expires_at:
+        return access_token
+
+    if refresh_token:
+        log_fn("Access token expired — refreshing…")
+        try:
+            data = refresh_access_token(client_id, client_secret, refresh_token)
+            save_token(data)
+            log_fn("Token refreshed.")
+            return data["access_token"]
+        except Exception as e:
+            log_fn(f"Token refresh failed ({e}) — re-authorizing…")
+
+    data = get_access_token_auth_code(client_id, client_secret, log_fn=log_fn)
+    save_token(data)
+    log_fn("Authorized.")
+    return data["access_token"]
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def sanitize_filename(text: str) -> str:
@@ -176,6 +330,26 @@ def _image_ext_from_url(url: str) -> str:
         if ext in ("jpg", "jpeg", "png", "gif", "webp", "bmp"):
             return ext
     return "jpg"
+
+
+def _best_video_url(videos: list) -> tuple[str, int] | None:
+    """Return (url, filesize) for the highest-quality entry in the deviation videos array.
+
+    DA API embeds direct CDN URLs in the videos array; prefer these over yt-dlp
+    so we are not dependent on yt-dlp's DeviantArt extractor staying functional.
+    Returns None if the list is empty or no entry has a src."""
+    def _quality_px(v):
+        try:
+            return int(str(v.get("quality", "0")).rstrip("p"))
+        except ValueError:
+            return 0
+
+    best = max(videos, key=_quality_px, default=None)
+    if best:
+        src = best.get("src", "")
+        if src:
+            return src, int(best.get("filesize", 0))
+    return None
 
 
 # ── Feed fetching ──────────────────────────────────────────────────────────────
@@ -421,31 +595,85 @@ def download_media(deviations, token, download_dir, media_type="both",
 
         elif dev_type == "film":
             dev_url = dev.get("url", "")
-            if not dev_url:
-                error_fn(f"No page URL for video: {title}")
-                done_count += 1
-                if progress_fn:
-                    progress_fn(done_count, total)
-                continue
+            videos  = dev.get("videos", [])
+            direct  = _best_video_url(videos)
 
-            fname   = f"{author}_{ts}_{title}_{short_id}_v.mp4"
-            out_tpl = os.path.join(download_dir, f"{author}_{ts}_{title}_{short_id}_v.%(ext)s")
-            if file_progress_fn:
-                file_progress_fn(fname, 0, 0)
-            try:
-                _download_video(dev_url, out_tpl)
-                log_fn(f"Saved video: {fname}")
-                videos_ok  += 1
-                done_count += 1
-                if progress_fn:
-                    progress_fn(done_count, total)
-                actual_path = os.path.join(download_dir, fname)
-                if os.path.exists(actual_path):
-                    bytes_total += os.path.getsize(actual_path)
-                if preview_fn and os.path.exists(actual_path):
-                    preview_fn(actual_path)
-            except Exception as e:
-                error_fn(f"Video failed ({title}): {e}")
+            if direct:
+                # Primary path: stream directly from the CDN URL in the videos array.
+                # yt-dlp's DeviantArt extractor is unreliable for newer URL formats.
+                vid_src, expected_size = direct
+                url_path = vid_src.split("?")[0]
+                vid_ext  = url_path.rsplit(".", 1)[-1].lower() if "." in url_path else "mp4"
+                if vid_ext not in ("mp4", "webm", "mov", "avi", "mkv"):
+                    vid_ext = "mp4"
+                fname = f"{author}_{ts}_{title}_{short_id}_v.{vid_ext}"
+                fpath = os.path.join(download_dir, fname)
+                if os.path.exists(fpath):
+                    done_count += 1
+                    if progress_fn:
+                        progress_fn(done_count, total)
+                    continue
+                if file_progress_fn:
+                    file_progress_fn(fname, 0, 0)
+                try:
+                    r = requests.get(vid_src, stream=True, timeout=120)
+                    r.raise_for_status()
+                    total_size = int(r.headers.get("Content-Length", expected_size))
+                    if file_progress_fn:
+                        file_progress_fn(fname, 0, total_size)
+                    downloaded_bytes = 0
+                    with open(fpath, "wb") as fh:
+                        for chunk in r.iter_content(chunk_size=65536):
+                            if chunk:
+                                fh.write(chunk)
+                                downloaded_bytes += len(chunk)
+                                if file_progress_fn:
+                                    file_progress_fn(fname, downloaded_bytes, total_size)
+                    log_fn(f"Saved video: {fname}")
+                    videos_ok   += 1
+                    bytes_total += downloaded_bytes
+                    done_count  += 1
+                    if progress_fn:
+                        progress_fn(done_count, total)
+                    if preview_fn:
+                        preview_fn(fpath)
+                except Exception as e:
+                    error_fn(f"Video failed ({title}): {e}")
+                    done_count += 1
+                    if progress_fn:
+                        progress_fn(done_count, total)
+
+            elif dev_url:
+                # Fallback: let yt-dlp attempt to extract from the deviation page URL.
+                fname   = f"{author}_{ts}_{title}_{short_id}_v.mp4"
+                out_tpl = os.path.join(download_dir, f"{author}_{ts}_{title}_{short_id}_v.%(ext)s")
+                fpath   = os.path.join(download_dir, fname)
+                if os.path.exists(fpath):
+                    done_count += 1
+                    if progress_fn:
+                        progress_fn(done_count, total)
+                    continue
+                if file_progress_fn:
+                    file_progress_fn(fname, 0, 0)
+                try:
+                    _download_video(dev_url, out_tpl)
+                    log_fn(f"Saved video: {fname}")
+                    videos_ok  += 1
+                    done_count += 1
+                    if progress_fn:
+                        progress_fn(done_count, total)
+                    if os.path.exists(fpath):
+                        bytes_total += os.path.getsize(fpath)
+                    if preview_fn and os.path.exists(fpath):
+                        preview_fn(fpath)
+                except Exception as e:
+                    error_fn(f"Video failed ({title}): {e}")
+                    done_count += 1
+                    if progress_fn:
+                        progress_fn(done_count, total)
+
+            else:
+                error_fn(f"No video URL for: {title}")
                 done_count += 1
                 if progress_fn:
                     progress_fn(done_count, total)
@@ -507,7 +735,7 @@ Register a DeviantArt app to get your client_id and client_secret:
 
     print("Getting access token…")
     try:
-        token = get_access_token(client_id, client_secret)
+        token = get_or_refresh_token(client_id, client_secret)
     except Exception as e:
         print(f"Authentication failed: {e}")
         sys.exit(1)
