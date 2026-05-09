@@ -14,7 +14,7 @@ Two entry points: a CLI (`dadownload.py`) and a PyQt6 GUI (`gui.py`).
 
 ---
 
-## Repository state (as of 2026-05-08, updated 2026-05-09, code updated 2026-05-09)
+## Repository state (as of 2026-05-09)
 
 Git is initialized. Remote is `https://github.com/Tamalero/deviantartDownload.git`, branch `main`.
 
@@ -23,6 +23,7 @@ Committed files:
 ```
 .gitignore
 CLAUDE.md
+README.md                  ← user-facing documentation (GitHub landing page)
 build_appimage.sh          ← AppImage Type 2 build script (executable)
 dadownload.py              ← main CLI + shared library
 deviantartdownload.desktop ← XDG desktop entry for AppImage
@@ -88,7 +89,7 @@ for Confidential apps.
 python gui.py
 
 # GUI (from AppImage)
-./DeviantArtDownload-1.0.0-x86_64.AppImage
+./DeviantArtDownload-1.1.0-x86_64.AppImage
 
 # CLI — user gallery
 python dadownload.py --mode gallery --user someartist
@@ -345,7 +346,7 @@ All functions are importable (no module-level side effects). `__main__` block ha
 
 | Symbol | Purpose |
 |---|---|
-| `VERSION` | Current version string (`"1.0.0"`) |
+| `VERSION` | Current version string (`"1.1.0"`) |
 | `GITHUB_REPO` | `"Tamalero/deviantartDownload"` — used by update checker and About dialog |
 | `_GITHUB_API` | GitHub Releases API URL constructed from `GITHUB_REPO` |
 | `CONFIG_FILE` | `Path` to `~/.config/deviantartdownload/config.ini` |
@@ -381,8 +382,8 @@ All functions are importable (no module-level side effects). `__main__` block ha
 | `fetch_user_gallery(token, username, ...)` | Wraps `_fetch_feed` → `gallery/all` |
 | `fetch_user_favourites(token, username, ...)` | Wraps `_fetch_feed` → `collections/all` |
 | `_get_deviation_download_url(token, id)` | Calls `/deviation/download/{id}`; returns `(url, ext)` or `None` |
-| `_download_video(url, output_template)` | Downloads via `yt_dlp` Python API using the deviation page URL |
-| `download_media(deviations, token, dir, ...)` | Downloads images (streaming) and videos (yt-dlp); returns stats dict |
+| `_download_video(url, output_template)` | Fallback: downloads via `yt_dlp` Python API using the deviation page URL (only called when `videos` array has no `src`) |
+| `download_media(deviations, token, dir, ...)` | Downloads images (streaming) and videos (direct CDN streaming via `_best_video_url`, yt-dlp fallback); returns stats dict |
 
 #### `download_media` full signature
 
@@ -500,8 +501,9 @@ Started automatically on first `showEvent`; also triggered manually via Help men
 
 ```
 Menu bar               (Help → Check for Updates, Help → About)
-Credentials Group      (client_id, client_secret [password field], auth status label,
-                        Authorize button, deviantart.com/developers link)
+Credentials Group      (info panel with numbered setup steps + redirect URI + mature-content note;
+                        client_id field, client_secret [password field], auth status label [countdown],
+                        Authorize button)
 Options Group          (mode, username, media type, pages, post delay, verbose checkbox)
 Output Folder Group    (path + Browse button)
 Start / Cancel buttons
@@ -543,12 +545,13 @@ Identical to BlueSkyDownload:
 
 #### Credentials group auth flow
 
-- `_lbl_auth_status`: green "Authorized · expires in N min" / orange "Token expired" / red "Not authorized"
-- `_btn_authorize`: starts `AuthWorker`; disabled while auth is in progress
-- `_authorize()`: validates fields, saves client_id/secret, starts `AuthWorker`
-- `_on_authorized(expires_at)`: re-enables button, calls `_update_auth_status`
-- `_on_auth_error(msg)`: re-enables button, shows error in red
-- `_update_auth_status(expires_at)`: updates label color and text from `time.time()` comparison
+- `_lbl_auth_status`: live countdown label; colours defined by the auth timer thresholds above
+- `_btn_authorize`: starts `AuthWorker`; disabled while auth is in progress (`self._authorizing = True`)
+- `_authorize()`: sets `_authorizing = True`, validates fields, saves client_id/secret, starts `AuthWorker`
+- `_on_authorized(expires_at)`: clears `_authorizing`, re-enables button, calls `_update_auth_status`
+- `_on_auth_error(msg)`: clears `_authorizing`, re-enables button, shows error in red
+- `_tick_auth_status()`: called every 10 s by `_auth_timer`; skipped when `_authorizing` or `_token_expires_at == 0`
+- `_update_auth_status(expires_at)`: stores `_token_expires_at`, applies colour thresholds, sets label
 - `_load_saved_credentials()`: loads client_id, client_secret, then calls `_update_auth_status` with stored `expires_at`
 
 #### `_start()` token resolution
@@ -642,9 +645,9 @@ Identical to BlueSkyDownload:
 | Page size | 50 posts | 24 deviations (DA API max) |
 | Pagination | Cursor-based | Offset-based (`has_more` + `next_offset`) |
 | Images | CDN `fullsize` URL | Full-res via `/deviation/download`, fallback to `content.src` |
-| Videos | HLS playlist via yt-dlp | Deviation page URL via yt-dlp |
+| Videos | HLS playlist via yt-dlp | Direct CDN streaming from `dev.videos[].src` (highest quality); yt-dlp fallback |
 | Config dir | `~/.config/blueskydownload/` | `~/.config/deviantartdownload/` |
 | Default output | `~/Pictures/BlueSkyDownload` | `~/Pictures/DeviantArtDownload` |
 | Update checker | Yes (GitHub Releases API) | Yes — GUI (Help menu + status bar) + `check_for_update()` in CLI module |
-| AppImage | No | Yes — `build_appimage.sh`, published at v1.0.0 |
+| AppImage | No | Yes — `build_appimage.sh`, published at v1.1.0 |
 | Verbose mode | No | Yes (checkbox + `--verbose` CLI flag) |
