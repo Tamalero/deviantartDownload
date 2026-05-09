@@ -14,7 +14,7 @@ Two entry points: a CLI (`dadownload.py`) and a PyQt6 GUI (`gui.py`).
 
 ---
 
-## Repository state (as of 2026-05-08)
+## Repository state (as of 2026-05-08, updated 2026-05-08)
 
 Git is initialized. Remote is `https://github.com/Tamalero/deviantartDownload.git`, branch `main`.
 
@@ -42,7 +42,7 @@ The tool requires a registered DeviantArt application to obtain OAuth2 credentia
   client ID and a client secret. "Public (browser side)" only gives a client ID.
 - **OAuth2 Redirect URI Whitelist:** set to `https://localhost` (placeholder — never actually
   called because the tool uses `client_credentials` grant, which has no redirect)
-- **client_id:** numeric ID assigned on registration (e.g. `66798`)
+- **client_id:** numeric ID assigned on registration (e.g. `12345`)
 - **client_secret:** hex string shown immediately after registration — copy it then; it is not
   shown again after navigating away
 
@@ -126,17 +126,23 @@ Both gallery and favourites use **offset-based** pagination (not cursor-based):
   "deviationid": "UUID-string",
   "title":       "Artwork Title",
   "url":         "https://www.deviantart.com/artist/art/title-123456",
-  "type":        "image | film | literature",
   "published_time": 1234567890,
   "author":      { "username": "artistname", ... },
   "content":     { "src": "https://cdn...", "width": N, "height": N, "filesize": N },
   "is_downloadable": true,
-  "is_mature":   false
+  "is_mature":   false,
+  "videos":      []
 }
 ```
 
-Only `type == "image"` and `type == "film"` are downloaded; `"literature"` and other types
-are silently skipped.
+**Important:** The DA API does **not** include a `type` field in deviation objects. Media type
+is inferred from the presence of other fields via `_deviation_media_type()`:
+
+- `videos` array non-empty → `"film"`
+- `content` dict present **or** `is_downloadable` is true → `"image"`
+- neither → `""` (literature, flash, etc. — silently skipped)
+
+Only `"image"` and `"film"` deviations are downloaded.
 
 ### Full-resolution download
 
@@ -179,7 +185,8 @@ All functions are importable (no module-level side effects). `__main__` block ha
 | `sanitize_filename(text)` | Strip non-alphanumeric chars (keep `_` and `-`) |
 | `format_timestamp(unix_ts)` | Unix timestamp → `YYYYMMDD_HHMMSS` string |
 | `_image_ext_from_url(url)` | Best-effort extension from CDN URL path |
-| `_fetch_feed(url, token, username, ...)` | Shared offset pagination loop; client-side filters by deviation type |
+| `_deviation_media_type(dev)` | Infer `"image"` / `"film"` / `""` from deviation fields (`content`, `videos`, `is_downloadable`) — DA API does not send a `type` field |
+| `_fetch_feed(url, token, username, ...)` | Shared offset pagination loop; client-side filters by deviation media type |
 | `fetch_user_gallery(token, username, ...)` | Wraps `_fetch_feed` → `gallery/all` |
 | `fetch_user_favourites(token, username, ...)` | Wraps `_fetch_feed` → `collections/all` |
 | `_get_deviation_download_url(token, id)` | Calls `/deviation/download/{id}`; returns `(url, ext)` or `None` |
@@ -343,8 +350,9 @@ Identical to BlueSkyDownload:
 - **Token expiry:** client_credentials tokens expire after ~1 hour. No auto-refresh; very long
   sessions will fail with 401 after expiry.
 - **Empty results investigation:** verbose mode was added because the app initially returned 0
-  deviations. The `[verbose]` per-page type breakdown shows whether DA is returning items of
-  unexpected types (e.g. `literature`) that are filtered out client-side.
+  deviations. The `[verbose]` per-page type breakdown (now based on `_deviation_media_type`)
+  shows whether DA is returning items that can't be classified. The verbose block also logs
+  `first item keys` to inspect the actual response shape when debugging.
 - **Mature content:** `mature_content=true` is sent on all requests but requires the registered
   app to have the `browse` scope with mature content enabled in DA developer settings. Without
   it, mature deviations will be omitted silently by the API.

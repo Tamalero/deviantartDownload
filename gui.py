@@ -95,6 +95,22 @@ class DownloadWorker(QThread):
             self.done.emit(False, str(e))
 
 
+# ── Update checker ─────────────────────────────────────────────────────────────
+
+class UpdateChecker(QThread):
+    update_available = pyqtSignal(str, str)  # (version, release_url)
+    up_to_date       = pyqtSignal()
+
+    def run(self):
+        tag, url = da.check_for_update()
+        if tag is None:
+            return
+        if da._version_tuple(tag) > da._version_tuple(da.VERSION):
+            self.update_available.emit(tag, url)
+        else:
+            self.up_to_date.emit()
+
+
 # ── Main window ────────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -104,6 +120,8 @@ class MainWindow(QMainWindow):
         self.setMinimumWidth(640)
         self.worker: DownloadWorker | None = None
         self._current_preview_pixmap: QPixmap | None = None
+        self._update_checker: UpdateChecker | None = None
+        self._manual_checker: UpdateChecker | None = None
         self._build_ui()
         self._load_saved_credentials()
         self._load_ui_state()
@@ -111,6 +129,8 @@ class MainWindow(QMainWindow):
     # ── UI construction ────────────────────────────────────────────────────────
 
     def _build_ui(self):
+        self._build_menu()
+
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
@@ -131,7 +151,25 @@ class MainWindow(QMainWindow):
 
         self.statusbar = QStatusBar()
         self.setStatusBar(self.statusbar)
+
+        self._update_label = QLabel()
+        self._update_label.setOpenExternalLinks(True)
+        self._update_label.setVisible(False)
+        self.statusbar.addPermanentWidget(self._update_label)
+
         self.statusbar.showMessage("Ready")
+
+    def _build_menu(self):
+        mb = self.menuBar()
+        help_menu = mb.addMenu("&Help")
+
+        act_check = help_menu.addAction("Check for &Updates")
+        act_check.triggered.connect(self._check_updates_manual)
+
+        help_menu.addSeparator()
+
+        act_about = help_menu.addAction(f"&About v{da.VERSION}")
+        act_about.triggered.connect(self._show_about)
 
     def _credentials_group(self) -> QGroupBox:
         g = QGroupBox("Credentials")
@@ -268,6 +306,10 @@ class MainWindow(QMainWindow):
     def showEvent(self, event):
         super().showEvent(event)
         self._apply_splitter_ratio()
+        if self._update_checker is None:
+            self._update_checker = UpdateChecker()
+            self._update_checker.update_available.connect(self._on_update_available)
+            self._update_checker.start()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -292,6 +334,35 @@ class MainWindow(QMainWindow):
             self._bottom_splitter.setSizes([preview_w, total - preview_w])
 
     # ── Slots ──────────────────────────────────────────────────────────────────
+
+    def _on_update_available(self, version: str, url: str):
+        self._update_label.setText(
+            f'<a href="{url}" style="color: #05cc47;">&#8593; v{version} available</a>'
+        )
+        self._update_label.setVisible(True)
+        self.statusbar.showMessage(
+            f"Update available: v{version} — click the link in the status bar or use Help menu",
+            8000,
+        )
+
+    def _check_updates_manual(self):
+        self.statusbar.showMessage("Checking for updates…")
+        self._manual_checker = UpdateChecker()
+        self._manual_checker.update_available.connect(self._on_update_available)
+        self._manual_checker.up_to_date.connect(
+            lambda: self.statusbar.showMessage("Already up to date.", 4000)
+        )
+        self._manual_checker.start()
+
+    def _show_about(self):
+        QMessageBox.about(
+            self,
+            f"DeviantArt Downloader v{da.VERSION}",
+            f"<b>DeviantArt Downloader</b> v{da.VERSION}<br><br>"
+            "Download images and videos from DeviantArt using the official API.<br><br>"
+            f'<a href="https://github.com/{da.GITHUB_REPO}">'
+            f"github.com/{da.GITHUB_REPO}</a>",
+        )
 
     def _build_delay_widget(self) -> QWidget:
         w = QWidget()

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=DeviantArt Downloader
+Exec=DeviantArtDownload
+Icon=deviantartdownload
+Type=Application
+Categories=Graphics;Network;
+Comment=Download images and videos from DeviantArt
+Terminal=false
+StartupNotify=true
+StartupWMClass=DeviantArtDownloader

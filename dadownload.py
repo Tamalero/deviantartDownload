@@ -12,7 +12,9 @@ import requests
 from tqdm import tqdm
 from cryptography.fernet import Fernet, InvalidToken
 
-VERSION = "1.0.0"
+VERSION     = "1.0.0"
+GITHUB_REPO = "Tamalero/deviantartDownload"
+_GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 # --- XDG paths ---
 _cfg_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
@@ -130,6 +132,43 @@ def format_timestamp(unix_ts) -> str:
         return "unknown_date"
 
 
+def _deviation_media_type(dev: dict) -> str:
+    """Infer media type from deviation fields — DA API does not include an explicit 'type' field."""
+    if dev.get("videos"):
+        return "film"
+    if dev.get("content") or dev.get("is_downloadable"):
+        return "image"
+    return ""
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except Exception:
+        return (0,)
+
+
+def check_for_update() -> tuple[str | None, str | None]:
+    """Check GitHub releases for a newer version.
+    Returns (tag_without_v, release_url) or (None, None) on failure or no releases yet."""
+    try:
+        resp = requests.get(
+            _GITHUB_API,
+            headers={"Accept": "application/vnd.github+json"},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return None, None
+        data = resp.json()
+        tag = data.get("tag_name", "").lstrip("v")
+        url = data.get("html_url", "")
+        if tag and url:
+            return tag, url
+    except Exception:
+        pass
+    return None, None
+
+
 def _image_ext_from_url(url: str) -> str:
     path = url.split("?")[0]
     if "." in path:
@@ -184,9 +223,11 @@ def _fetch_feed(url, token, username, max_pages, page_size, log_fn, media_type="
             if verbose:
                 type_counts: dict[str, int] = {}
                 for dev in results:
-                    t = dev.get("type", "unknown")
+                    t = _deviation_media_type(dev) or "unknown"
                     type_counts[t] = type_counts.get(t, 0) + 1
                 log_fn(f"[verbose] page returned {len(results)} items — types: {type_counts}")
+                if results:
+                    log_fn(f"[verbose] first item keys: {list(results[0].keys())}")
                 log_fn(f"[verbose] has_more={data.get('has_more')}  next_offset={data.get('next_offset')}")
 
             if not results:
@@ -195,7 +236,7 @@ def _fetch_feed(url, token, username, max_pages, page_size, log_fn, media_type="
                 break
 
             for dev in results:
-                dev_type = dev.get("type", "")
+                dev_type = _deviation_media_type(dev)
                 if media_type in ("images", "both") and dev_type == "image":
                     items.append(dev)
                 elif media_type in ("videos", "both") and dev_type == "film":
@@ -260,8 +301,9 @@ def _download_video(url: str, output_template: str):
         "quiet":               True,
         "no_warnings":         True,
     }
-    if getattr(sys, "frozen", False):
-        opts["ffmpeg_location"] = sys._MEIPASS
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        if os.path.isfile(os.path.join(sys._MEIPASS, "ffmpeg")):
+            opts["ffmpeg_location"] = sys._MEIPASS
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([url])
@@ -305,7 +347,7 @@ def download_media(deviations, token, download_dir, media_type="both",
             log_fn("Download cancelled.")
             return {"images": images_ok, "videos": videos_ok, "bytes": bytes_total}
 
-        dev_type = dev.get("type", "")
+        dev_type = _deviation_media_type(dev)
         author   = sanitize_filename(dev.get("author", {}).get("username", "unknown"))
         title    = sanitize_filename(dev.get("title", "untitled"))[:40]
         dev_id   = str(dev.get("deviationid", "noid"))

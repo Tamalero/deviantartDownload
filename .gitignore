@@ -1,5 +1,6 @@
 config.ini
 secret.key
+credentials.txt
 __pycache__/
 *.pyc
 Downloads/
