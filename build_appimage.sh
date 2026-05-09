@@ -53,6 +53,27 @@ python3 -m PyInstaller \
     --collect-all yt_dlp \
     --hidden-import cryptography.fernet \
     --hidden-import tqdm \
+    --exclude-module torch \
+    --exclude-module torchvision \
+    --exclude-module torchaudio \
+    --exclude-module scipy \
+    --exclude-module numpy \
+    --exclude-module pandas \
+    --exclude-module matplotlib \
+    --exclude-module sympy \
+    --exclude-module PIL \
+    --exclude-module Pillow \
+    --exclude-module sklearn \
+    --exclude-module tensorflow \
+    --exclude-module keras \
+    --exclude-module jinja2 \
+    --exclude-module lxml \
+    --exclude-module gi \
+    --exclude-module pytest \
+    --exclude-module pygments \
+    --exclude-module IPython \
+    --exclude-module ipykernel \
+    --exclude-module notebook \
     gui.py
 
 # Optional: bundle system ffmpeg to make video downloads fully self-contained.
