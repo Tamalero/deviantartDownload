@@ -10,11 +10,11 @@ Two entry points: a CLI (`dadownload.py`) and a PyQt6 GUI (`gui.py`).
 - **Python:** system Python 3 (no virtualenv — all deps via pacman)
 - **XDG config:** `~/.config/deviantartdownload/config.ini`
 - **Default output:** `~/Pictures/DeviantArtDownload`
-- **Latest release:** v1.0.0
+- **Latest release:** v1.1.0 — https://github.com/Tamalero/deviantartDownload/releases/tag/v1.1.0
 
 ---
 
-## Repository state (as of 2026-05-08, updated 2026-05-08)
+## Repository state (as of 2026-05-08, updated 2026-05-09, code updated 2026-05-09)
 
 Git is initialized. Remote is `https://github.com/Tamalero/deviantartDownload.git`, branch `main`.
 
@@ -23,13 +23,17 @@ Committed files:
 ```
 .gitignore
 CLAUDE.md
-dadownload.py         ← main CLI + shared library
-gui.py                ← PyQt6 GUI (imports dadownload)
+build_appimage.sh          ← AppImage Type 2 build script (executable)
+dadownload.py              ← main CLI + shared library
+deviantartdownload.desktop ← XDG desktop entry for AppImage
+deviantartdownload.svg     ← SVG icon source (dark bg, green "DA" text)
+gui.py                     ← PyQt6 GUI (imports dadownload)
 requirements.txt
 ```
 
-**Not committed** (covered by `.gitignore`): `config.ini`, `secret.key`, `__pycache__/`,
-`Downloads/`, `Downloaded_images/`, `*.AppImage`, `*.AppDir/`, `dist/`, `build/`, `*.spec`
+**Not committed** (covered by `.gitignore`): `config.ini`, `secret.key`, `credentials.txt`,
+`__pycache__/`, `Downloads/`, `Downloaded_images/`, `*.AppImage`, `*.AppImage.zsync`,
+`*.AppDir/`, `dist/`, `build/`, `*.spec`
 
 ---
 
@@ -40,11 +44,18 @@ The tool requires a registered DeviantArt application to obtain OAuth2 credentia
 - **Registration URL:** https://www.deviantart.com/developers/
 - **App type:** **Confidential (server side)** — this is the only type that provides both a
   client ID and a client secret. "Public (browser side)" only gives a client ID.
-- **OAuth2 Redirect URI Whitelist:** set to `https://localhost` (placeholder — never actually
-  called because the tool uses `client_credentials` grant, which has no redirect)
+- **OAuth2 Redirect URI Whitelist:** must include `http://localhost:8765/callback` — this is
+  the local callback address used by the Authorization Code flow. Add it exactly as written
+  (HTTP, port 8765, path `/callback`).
 - **client_id:** numeric ID assigned on registration (e.g. `12345`)
 - **client_secret:** hex string shown immediately after registration — copy it then; it is not
   shown again after navigating away
+
+### DA developer portal fields (complete list)
+
+Title, Description, OAuth2 Redirect URI Whitelist, Client type, Download URL, Original URL
+Whitelist. There are **no** grant type or response type toggles — all grant types are available
+for Confidential apps.
 
 ---
 
@@ -59,43 +70,211 @@ The tool requires a registered DeviantArt application to obtain OAuth2 credentia
 | `yt-dlp` | installed |
 | `ffmpeg` | installed |
 
+### AppImage build dependencies
+
+| Tool | Install |
+|---|---|
+| `python-pyinstaller` | `sudo pacman -S python-pyinstaller` or `pip install --user --break-system-packages pyinstaller` |
+| `librsvg` | `sudo pacman -S librsvg` (provides `rsvg-convert` for icon conversion) |
+| `fuse2` | `sudo pacman -S fuse2` (required to run the resulting AppImage) |
+| `appimagetool` | downloaded automatically from GitHub if not in PATH; cached as `appimagetool-x86_64.AppImage` |
+
 ---
 
 ## Running
 
 ```bash
-# GUI
+# GUI (from source)
 python gui.py
+
+# GUI (from AppImage)
+./DeviantArtDownload-1.0.0-x86_64.AppImage
 
 # CLI — user gallery
 python dadownload.py --mode gallery --user someartist
 
 # CLI — user favourites, images only, verbose debug output
 python dadownload.py --mode favourites --user someartist --media images --pages 10 --verbose
+
+# Build AppImage
+bash build_appimage.sh
 ```
+
+---
+
+## AppImage packaging
+
+The project ships as a **Type 2 AppImage** (SquashFS + ELF runtime).
+
+### Build script: `build_appimage.sh`
+
+Reads `VERSION` dynamically from the `dadownload` module. Full pipeline:
+
+1. **Check PyInstaller** — errors with install instructions if missing
+2. **Clean** previous `build/`, `dist/`, `*.AppDir/` artifacts
+3. **PyInstaller** (`--onedir --windowed`) with:
+   - `--collect-all yt_dlp` — bundles yt-dlp plugin tree
+   - `--hidden-import cryptography.fernet` — not auto-detected by PyInstaller
+   - 20 `--exclude-module` flags for heavy unused system packages (torch, torchvision,
+     torchaudio, scipy, numpy, pandas, matplotlib, sympy, PIL, Pillow, sklearn, tensorflow,
+     keras, jinja2, lxml, gi, pytest, pygments, IPython, ipykernel, notebook)
+4. **Assemble AppDir** — copies PyInstaller onedir output to `AppDir/usr/bin/`; writes
+   `AppRun` launcher script; copies `.desktop` entry
+5. **Generate icon** — tries `rsvg-convert` → `inkscape` → `convert` (ImageMagick) → Python
+   stdlib fallback (writes a raw 256×256 RGB PNG). Copies icon as both
+   `deviantartdownload.png` and `.DirIcon`
+6. **Locate or download `appimagetool`** — checks PATH first, then local cached file, then
+   downloads from GitHub releases and caches
+7. **Build AppImage** with embedded update info:
+   ```
+   gh-releases-zsync|Tamalero|deviantartDownload|latest|DeviantArtDownload-*-x86_64.AppImage.zsync
+   ```
+   Output: `DeviantArtDownload-<version>-x86_64.AppImage` (~117 MB)
+
+> **Note on PEP 668 (Arch Linux):** system Python blocks `pip install --user pyinstaller`
+> without `--break-system-packages`. Use:
+> `pip install --user --break-system-packages pyinstaller`
+
+### AppDir structure
+
+```
+DeviantArtDownload.AppDir/
+  AppRun                          ← bash launcher; prepends usr/bin to PATH
+  deviantartdownload.desktop
+  deviantartdownload.png          ← 256×256 PNG converted from SVG
+  .DirIcon                        ← copy of the PNG (AppImage spec)
+  usr/bin/
+    DeviantArtDownload            ← PyInstaller ELF launcher
+    _internal/                   ← Python stdlib + all bundled packages
+```
+
+### zsync delta updates
+
+`appimagetool --updateinformation` embeds the update URI so AppImageUpdate-compatible tools
+can delta-patch to newer versions using the `.AppImage.zsync` companion file attached to
+each GitHub release.
+
+### ffmpeg in AppImage
+
+System `ffmpeg` (from pacman) is used at runtime — it is **not** bundled in the AppImage.
+To bundle it, uncomment the `--add-binary` line in `build_appimage.sh`. The `_download_video`
+function only sets `ffmpeg_location` to `sys._MEIPASS` if an `ffmpeg` binary is actually
+present there (`os.path.isfile` check).
+
+---
+
+## Update checker
+
+### `dadownload.py` constants
+
+```python
+GITHUB_REPO = "Tamalero/deviantartDownload"
+_GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+```
+
+### `check_for_update() → (tag | None, url | None)`
+
+GETs `_GITHUB_API` with a 5-second timeout. Returns `(tag_without_v, release_html_url)` or
+`(None, None)` on network failure, non-200 response, or no releases.
+
+### `_version_tuple(v: str) → tuple[int, ...]`
+
+Splits a version string on `.` and returns a tuple of ints for comparison. Falls back to
+`(0,)` on any parse error.
+
+### `UpdateChecker(QThread)` in `gui.py`
+
+| Signal | Signature | Emitted when |
+|---|---|---|
+| `update_available` | `(str, str)` | Latest release tag > current VERSION |
+| `up_to_date` | `()` | Latest release tag ≤ current VERSION |
+
+- **Automatic check**: started once in `showEvent` on first window show; stored in
+  `self._update_checker`. Silent on network failure (no signal emitted if `tag is None`).
+- **Manual check**: `Help → Check for Updates` triggers `_check_updates_manual()` which
+  creates `self._manual_checker` and connects both signals.
+
+### Status bar update label
+
+A `QLabel` (`self._update_label`) is added as a permanent status bar widget. Hidden until an
+update is detected. When shown:
+```html
+<a href="{release_url}" style="color: #05cc47;">↑ v{version} available</a>
+```
+`setOpenExternalLinks(True)` — clicking opens the release page in the system browser.
 
 ---
 
 ## Authentication flow
 
-DeviantArt uses OAuth2. The tool uses the **client_credentials** grant — no user browser login
-is required. A fresh token is fetched at the start of every download session.
+### OAuth 2.1 — Authorization Code + PKCE (current)
 
+DeviantArt **requires PKCE** for all newly registered apps (OAuth 2.1). The tool uses the
+**Authorization Code** grant with S256 PKCE, which authenticates as the user's DA account
+(enabling mature content access). A one-time browser login is required; the resulting token
+pair is stored encrypted in config and refreshed automatically.
+
+**Why auth code instead of client_credentials:**
+`client_credentials` returns a token with no user identity. DeviantArt blocks mature content
+for these tokens with `{"error": "unauthorized", "error_description": "Content blocked due to
+user's mature content setting"}`, regardless of `mature_content=true` in the request. The user's
+DA account must have mature content viewing enabled and be age-verified on DA's side.
+
+**Authorization flow:**
+
+```
+1. GET https://www.deviantart.com/oauth2/authorize
+     ?response_type=code
+     &client_id=<id>
+     &redirect_uri=http://localhost:8765/callback
+     &scope=browse
+     &state=<random_hex>
+     &code_challenge=<base64url(SHA256(code_verifier))>
+     &code_challenge_method=S256
+
+   → DA opens browser login page → user approves → DA redirects to localhost:8765/callback?code=...
+
+2. POST https://www.deviantart.com/oauth2/token
+     grant_type=authorization_code
+     client_id=<id>
+     client_secret=<secret>
+     code=<code>
+     redirect_uri=http://localhost:8765/callback
+     code_verifier=<original_random_verifier>
+
+   → { "access_token": "...", "refresh_token": "...", "expires_in": 3600, ... }
+```
+
+**Token refresh (automatic):**
 ```
 POST https://www.deviantart.com/oauth2/token
+  grant_type=refresh_token
   client_id=<id>
   client_secret=<secret>
-  grant_type=client_credentials
-
-→ { "access_token": "...", "token_type": "Bearer", "expires_in": 3600, ... }
+  refresh_token=<refresh_token>
 ```
 
-Token lifetime is typically 1 hour. Long downloads may hit expiry; no automatic refresh is
-implemented — the token is fetched once per session and reused.
+Token lifetime is ~1 hour. Refresh happens automatically on next Start if expired (GUI) or
+on next CLI invocation via `get_or_refresh_token`. Re-auth via browser is only needed if the
+refresh token is also expired or revoked.
 
-All subsequent API calls send `Authorization: Bearer <access_token>` and include
-`mature_content=true` to include NSFW deviations (requires the app to have that permission
-enabled in DA developer settings).
+`scope=browse` is required — omitting it results in 403 on gallery/collections endpoints.
+
+### PKCE implementation detail
+
+```python
+code_verifier  = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
+code_challenge = base64.urlsafe_b64encode(
+    hashlib.sha256(code_verifier.encode()).digest()
+).rstrip(b"=").decode()
+```
+
+Uses only Python stdlib (`base64`, `hashlib`, `os`) — no extra dependencies.
+
+### `client_credentials` (legacy, kept for reference)
+
+`get_access_token(client_id, client_secret)` still exists in `dadownload.py` but is no longer
+called by the GUI or CLI. It cannot access mature content.
 
 ---
 
@@ -167,10 +346,14 @@ All functions are importable (no module-level side effects). `__main__` block ha
 | Symbol | Purpose |
 |---|---|
 | `VERSION` | Current version string (`"1.0.0"`) |
+| `GITHUB_REPO` | `"Tamalero/deviantartDownload"` — used by update checker and About dialog |
+| `_GITHUB_API` | GitHub Releases API URL constructed from `GITHUB_REPO` |
 | `CONFIG_FILE` | `Path` to `~/.config/deviantartdownload/config.ini` |
 | `KEY_FILE` | `Path` to `~/.config/deviantartdownload/secret.key` (Fernet key, mode 600) |
 | `DEFAULT_DOWNLOAD_DIR` | `~/Pictures/DeviantArtDownload` |
 | `TOKEN_URL` | `https://www.deviantart.com/oauth2/token` |
+| `AUTH_URL` | `https://www.deviantart.com/oauth2/authorize` |
+| `REDIRECT_PORT` | `8765` — localhost port for OAuth2 callback; whitelist `http://localhost:8765/callback` in DA app |
 | `GALLERY_URL` | `https://www.deviantart.com/api/v1/oauth2/gallery/all` |
 | `FAVOURITES_URL` | `https://www.deviantart.com/api/v1/oauth2/collections/all` |
 | `DOWNLOAD_URL` | `https://www.deviantart.com/api/v1/oauth2/deviation/download` |
@@ -181,11 +364,19 @@ All functions are importable (no module-level side effects). `__main__` block ha
 | `encrypt_password(pw)` | Fernet-encrypt a string → base64 token |
 | `decrypt_password(token)` | Decrypt Fernet token; returns `None` if token looks like Fernet but key is wrong/missing; returns token unchanged for legacy plaintext (migration path) |
 | `get_client_secret(cfg)` | Read + decrypt `client_secret` from loaded config; returns `None` if absent or undecryptable |
-| `get_access_token(id, secret)` | POST client_credentials → returns access token string |
+| `get_access_token(id, secret)` | Legacy `client_credentials` grant — kept but not called by GUI/CLI; cannot access mature content |
+| `get_access_token_auth_code(id, secret, port, log_fn)` | OAuth2 Authorization Code + PKCE flow — opens browser, runs local callback server on `port`, returns full token dict |
+| `refresh_access_token(id, secret, refresh_token)` | Exchange refresh token for new access token; returns token dict |
+| `save_token(token_data)` | Encrypts and persists `access_token`, `refresh_token`, `token_expires_at` to `[credentials]` config section |
+| `load_token(cfg)` | Returns `(access_token, refresh_token, expires_at)` from loaded config; decrypts values |
+| `get_or_refresh_token(id, secret, log_fn)` | CLI helper — returns valid token from config, refreshes if expired, re-authorizes via browser if refresh fails |
 | `sanitize_filename(text)` | Strip non-alphanumeric chars (keep `_` and `-`) |
 | `format_timestamp(unix_ts)` | Unix timestamp → `YYYYMMDD_HHMMSS` string |
 | `_image_ext_from_url(url)` | Best-effort extension from CDN URL path |
+| `_best_video_url(videos)` | Pick highest-quality entry from deviation `videos` array → `(url, filesize)` or `None`; used to bypass yt-dlp for direct CDN streaming |
 | `_deviation_media_type(dev)` | Infer `"image"` / `"film"` / `""` from deviation fields (`content`, `videos`, `is_downloadable`) — DA API does not send a `type` field |
+| `_version_tuple(v)` | Split version string → `tuple[int, ...]` for comparison |
+| `check_for_update()` | GET GitHub Releases API → `(tag, url)` or `(None, None)` |
 | `_fetch_feed(url, token, username, ...)` | Shared offset pagination loop; client-side filters by deviation media type |
 | `fetch_user_gallery(token, username, ...)` | Wraps `_fetch_feed` → `gallery/all` |
 | `fetch_user_favourites(token, username, ...)` | Wraps `_fetch_feed` → `collections/all` |
@@ -270,10 +461,47 @@ After `download_media` returns, the worker emits a summary line:
 ── Summary ──  Images: N  │  Videos: N  │  Total: N files  │  X.X MB
 ```
 
+#### Auth countdown timer
+
+`MainWindow` owns a `QTimer` (`self._auth_timer`, 10 s interval) that calls `_tick_auth_status()` while the window is open. The timer is a no-op when `self._token_expires_at == 0` (never authorized) or `self._authorizing is True` (browser flow in progress, avoids overwriting the "Authorizing…" label).
+
+`_update_auth_status(expires_at)` stores the value and applies thresholds:
+
+| Remaining | Color | Text |
+|---|---|---|
+| > 15 min | `#05cc47` green | `Authorized · expires in X min` |
+| 5–15 min | `#f8c800` yellow | `Authorized · expires in X min` |
+| < 5 min | `#ff5555` red | `Authorized · expires in Xm YYs` |
+| expired | `#ff9900` orange | `Token expired — click Authorize…` |
+
+`self._authorizing` is set `True` in `_authorize()` and cleared in `_on_authorized()` / `_on_auth_error()`.
+
+#### `AuthWorker(QThread)`
+
+| Signal | Signature | Purpose |
+|---|---|---|
+| `authorized` | `int` | Auth succeeded: `expires_at` unix timestamp |
+| `auth_error` | `str` | Auth failed: error message |
+| `log` | `str` | Progress messages (forwarded to log panel) |
+
+Runs `da.get_access_token_auth_code()` in background, calls `da.save_token()` on success,
+emits `authorized(expires_at)`. Started by clicking "Authorize with DeviantArt…".
+
+#### `UpdateChecker(QThread)`
+
+| Signal | Signature | Purpose |
+|---|---|---|
+| `update_available` | `(str, str)` | New version detected: `(tag, release_url)` |
+| `up_to_date` | `()` | Current version is latest |
+
+Started automatically on first `showEvent`; also triggered manually via Help menu.
+
 #### `MainWindow(QMainWindow)` — UI layout
 
 ```
-Credentials Group      (client_id, client_secret [password field], deviantart.com/developers link)
+Menu bar               (Help → Check for Updates, Help → About)
+Credentials Group      (client_id, client_secret [password field], auth status label,
+                        Authorize button, deviantart.com/developers link)
 Options Group          (mode, username, media type, pages, post delay, verbose checkbox)
 Output Folder Group    (path + Browse button)
 Start / Cancel buttons
@@ -281,10 +509,16 @@ Progress Group         (total bar + count label, file bar + filename/size label)
 QSplitter (horizontal, non-collapsible):
   ├── Preview Group    (QLabel — scales with panel, KeepAspectRatio)
   └── Log Group        (QTextEdit — read-only, monospace, HTML-colored)
-StatusBar
+StatusBar              (left: messages, right: update link label — hidden until update detected)
 ```
 
-No menu bar (no update checker — no GitHub releases yet).
+#### Help menu (`_build_menu`)
+
+- **Check for Updates** → `_check_updates_manual()` — fires a fresh `UpdateChecker`; shows
+  "Checking for updates…" in status bar; on result shows either the update label or
+  "Already up to date."
+- **About v{VERSION}** → `_show_about()` — `QMessageBox.about` with version, description,
+  and link to `github.com/{GITHUB_REPO}`
 
 #### Download Options fields
 
@@ -307,9 +541,29 @@ Identical to BlueSkyDownload:
 - Variable mode: `dsb_delay_min` (default 0.5 s) + `dsb_delay_max` (default 2.0 s)
 - Visibility toggled by `_on_delay_type_changed`
 
+#### Credentials group auth flow
+
+- `_lbl_auth_status`: green "Authorized · expires in N min" / orange "Token expired" / red "Not authorized"
+- `_btn_authorize`: starts `AuthWorker`; disabled while auth is in progress
+- `_authorize()`: validates fields, saves client_id/secret, starts `AuthWorker`
+- `_on_authorized(expires_at)`: re-enables button, calls `_update_auth_status`
+- `_on_auth_error(msg)`: re-enables button, shows error in red
+- `_update_auth_status(expires_at)`: updates label color and text from `time.time()` comparison
+- `_load_saved_credentials()`: loads client_id, client_secret, then calls `_update_auth_status` with stored `expires_at`
+
+#### `_start()` token resolution
+
+1. Load `(access_token, refresh_token, expires_at)` via `da.load_token()`
+2. If `access_token` valid and not expired → use it
+3. Elif `refresh_token` exists → call `da.refresh_access_token()` inline (synchronous), save, update status label
+4. Else → show error "Not authorized. Click Authorize first." and return
+5. Pass resolved token as `cfg["access_token"]` to `DownloadWorker` — worker does **not** fetch its own token
+
 #### Config persistence
 
-- `[credentials]`: `client_id` (plaintext), `client_secret` (Fernet-encrypted) — saved on Start
+- `[credentials]`: `client_id` (plaintext), `client_secret` (Fernet-encrypted), `access_token`
+  (Fernet-encrypted), `refresh_token` (Fernet-encrypted), `token_expires_at` (plaintext unix
+  timestamp) — credentials saved on Authorize/Start; token fields saved by `da.save_token()`
 - `[last_run]`: `mode`, `username`, `media`, `pages`, `output`, `delay_type`, `delay_fixed`,
   `delay_min`, `delay_max` — saved on Start; `verbose` is NOT persisted
 - Both sections use read-modify-write via `save_config` / `save_ui_state`
@@ -347,22 +601,32 @@ Identical to BlueSkyDownload:
 
 ## Known limitations / open issues
 
-- **Token expiry:** client_credentials tokens expire after ~1 hour. No auto-refresh; very long
-  sessions will fail with 401 after expiry.
+- **Token expiry / refresh:** access tokens expire after ~1 hour. The GUI refreshes automatically
+  on Start if a refresh_token is stored. CLI uses `get_or_refresh_token` which also auto-refreshes.
+  Full re-auth (browser) is only needed if the refresh token itself expires or is revoked.
+- **Mature content requires user account setup:** `mature_content=true` is effective only when
+  the authenticated DA account has mature content viewing enabled in DA account settings AND is
+  age-verified on DA. The Authorization Code flow carries the user's session, so this is now
+  user-controlled rather than app-controlled.
 - **Empty results investigation:** verbose mode was added because the app initially returned 0
   deviations. The `[verbose]` per-page type breakdown (now based on `_deviation_media_type`)
   shows whether DA is returning items that can't be classified. The verbose block also logs
   `first item keys` to inspect the actual response shape when debugging.
-- **Mature content:** `mature_content=true` is sent on all requests but requires the registered
-  app to have the `browse` scope with mature content enabled in DA developer settings. Without
-  it, mature deviations will be omitted silently by the API.
-- **Video downloads:** uses yt-dlp with the deviation page `url` field (not a direct video URL).
-  yt-dlp must be installed via pacman. Progress bar shows indeterminate for videos (no byte
-  callback from yt-dlp).
-- **Private content:** client_credentials grant cannot access private deviations or private
-  collections — only public content is visible.
+- **Video downloads:** primary path streams directly from `dev["videos"][N]["src"]` (highest
+  quality chosen by `_best_video_url`), using the same chunked-streaming path as images — so
+  the file progress bar works for videos too. yt-dlp is a fallback only for the rare case where
+  `videos` has no `src` but a page URL is present. Fixed "Unsupported URL" errors that appeared
+  with newer long-ID DA URLs (yt-dlp's DA extractor did not handle them).
+- **Private content:** the auth code token grants access to the authenticated user's own private
+  deviations/collections if they are the target username. Other users' private content remains
+  inaccessible.
 - **No cross-run dedup:** skips files if the output filename already exists on disk.
 - **Literature/Flash:** silently skipped (not downloaded).
+- **AppImage size:** ~117 MB after excluding heavy system packages from PyInstaller. If new
+  system packages are installed globally that trigger PyInstaller hooks, the bundle can grow;
+  re-add `--exclude-module` flags as needed.
+- **AppImage auth flow:** the OAuth2 browser flow works from AppImage as-is since it uses
+  `webbrowser.open()` and a local HTTP server — no GUI browser dependency.
 
 ---
 
@@ -370,7 +634,7 @@ Identical to BlueSkyDownload:
 
 | Aspect | BlueSkyDownload | DeviantArtDownload |
 |---|---|---|
-| Auth | Handle + App Password (AT Protocol) | Client ID + Client Secret (OAuth2 client_credentials) |
+| Auth | Handle + App Password (AT Protocol) | Client ID + Client Secret + OAuth2 Authorization Code + PKCE (user browser login) |
 | Core module | `apitest.py` | `dadownload.py` |
 | Mode 1 | Liked Posts | User Favourites |
 | Mode 2 | User Gallery | User Gallery |
@@ -381,5 +645,6 @@ Identical to BlueSkyDownload:
 | Videos | HLS playlist via yt-dlp | Deviation page URL via yt-dlp |
 | Config dir | `~/.config/blueskydownload/` | `~/.config/deviantartdownload/` |
 | Default output | `~/Pictures/BlueSkyDownload` | `~/Pictures/DeviantArtDownload` |
-| Update checker | Yes (GitHub Releases API) | No (no releases yet) |
+| Update checker | Yes (GitHub Releases API) | Yes — GUI (Help menu + status bar) + `check_for_update()` in CLI module |
+| AppImage | No | Yes — `build_appimage.sh`, published at v1.0.0 |
 | Verbose mode | No | Yes (checkbox + `--verbose` CLI flag) |
