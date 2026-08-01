@@ -694,9 +694,10 @@ process must appear, and no `resource_tracker: process died unexpectedly` warnin
   `-W error` the broad `except` turned every filename into `unknown_date`. Output is
   byte-identical to the old implementation, so existing downloads still dedup correctly.
 - **Literature/Flash:** silently skipped (not downloaded).
-- **AppImage size:** ~117 MB after excluding heavy system packages from PyInstaller. If new
-  system packages are installed globally that trigger PyInstaller hooks, the bundle can grow;
-  re-add `--exclude-module` flags as needed.
+- **AppImage size:** ~126 MB at v1.2.1 after excluding heavy system packages from PyInstaller.
+  If new system packages are installed globally that trigger PyInstaller hooks, the bundle can
+  grow; re-add `--exclude-module` flags as needed. See the size-drift note under AppImage
+  packaging — most of the v1.2.0 → v1.2.1 growth was host Qt/KDE libraries, not app code.
 - **AppImage auth flow:** the OAuth2 browser flow works from AppImage as-is since it uses
   `webbrowser.open()` and a local HTTP server — no GUI browser dependency.
 
