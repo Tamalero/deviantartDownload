@@ -5,14 +5,23 @@ import random
 import re
 import argparse
 import configparser
+import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 from tqdm import tqdm
 from cryptography.fernet import Fernet, InvalidToken
 
-VERSION     = "1.2.0"
+# tqdm's default write lock is a multiprocessing.RLock. Building it opens a POSIX
+# semaphore, which makes multiprocessing start its resource-tracker helper by
+# re-running sys.executable. In a PyInstaller build sys.executable *is* the app,
+# and the bootloader ignores the interpreter args it is handed — so the "helper"
+# comes up as a second copy of the GUI. This app is single-process; a plain thread
+# lock is all the progress bars need. Must run before the first tqdm() call.
+tqdm.set_lock(threading.RLock())
+
+VERSION     = "1.2.1"
 GITHUB_REPO = "Tamalero/deviantartDownload"
 _GITHUB_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -32,6 +41,31 @@ FAVOURITES_URL = f"{API_BASE}/collections/all"
 DOWNLOAD_URL   = f"{API_BASE}/deviation/download"
 AUTH_URL       = f"{_DA_BASE}/oauth2/authorize"
 REDIRECT_PORT  = 8765   # add http://localhost:8765 to your DA app's redirect URI whitelist
+
+
+# ── Frozen-app helpers ─────────────────────────────────────────────────────────
+
+def handle_reexec_args():
+    """Bail out early when this process is a Python re-exec, not a real launch.
+
+    PyInstaller's bootloader drops any interpreter arguments it is given and just
+    runs the app, so whenever the stdlib re-runs sys.executable — multiprocessing's
+    resource tracker (`-c 'from multiprocessing.resource_tracker import main…'`) or
+    a spawned Process — the frozen binary opens a second window instead. Run what
+    the interpreter was asked to run, then exit. No-op outside a frozen build.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+
+    args = sys.argv[1:]
+    if not args or not args[0].startswith("-"):
+        return                      # ordinary launch (no args, or a file/URL)
+
+    if "-c" in args:
+        code = args[args.index("-c") + 1]
+        if code.startswith(("from multiprocessing", "import multiprocessing")):
+            exec(code, {"__name__": "__main__"})
+    sys.exit(0)
 
 
 # ── Config helpers ─────────────────────────────────────────────────────────────
@@ -87,7 +121,9 @@ def decrypt_password(token: str) -> str | None:
     Returns the token unchanged for legacy plain-text values (migration path)."""
     try:
         return Fernet(_get_or_create_key()).decrypt(token.encode()).decode()
-    except (InvalidToken, Exception):
+    except (InvalidToken, ValueError, TypeError, OSError):
+        # InvalidToken: wrong/lost key. ValueError: malformed key file (binascii.Error
+        # included). OSError: key file unreadable.
         if token.startswith("gAAAAA"):
             return None
         return token
@@ -280,9 +316,9 @@ def sanitize_filename(text: str) -> str:
 
 def format_timestamp(unix_ts) -> str:
     try:
-        dt = datetime.utcfromtimestamp(int(unix_ts))
+        dt = datetime.fromtimestamp(int(unix_ts), tz=timezone.utc)
         return dt.strftime("%Y%m%d_%H%M%S")
-    except Exception:
+    except (ValueError, TypeError, OverflowError, OSError):
         return "unknown_date"
 
 
@@ -482,6 +518,18 @@ def _get_deviation_download_url(token: str, deviationid: str) -> tuple[str, str]
     return None
 
 
+def _discard_partial(path: str, log_fn):
+    """Delete a half-written file after a cancel.
+
+    Downloads are skipped when the output name already exists, so a truncated file
+    left behind would be treated as complete by every later run."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    log_fn(f"Download cancelled — discarded partial {os.path.basename(path)}")
+
+
 def _download_video(url: str, output_template: str):
     import yt_dlp
 
@@ -512,7 +560,9 @@ def download_media(deviations, token, download_dir, media_type="both",
     media_type:       "images" | "videos" | "both"
     convert_webp:     None | "png" | "jpg" — convert WebP images after download (requires Pillow)
     error_fn:         called for per-file errors; defaults to log_fn
-    cancel_fn:        optional callable; stops when it returns True
+    cancel_fn:        optional callable; stops when it returns True — checked between
+                      deviations, per chunk while streaming, and during the post delay.
+                      A file interrupted mid-stream is deleted, not left truncated
     progress_fn:      called with (done_count, total_count) after each file
     file_progress_fn: called with (filename, bytes_done, bytes_total) during streaming
     preview_fn:       called with (filepath) after each successful save
@@ -590,13 +640,20 @@ def download_media(deviations, token, download_dir, media_type="both",
                 if file_progress_fn:
                     file_progress_fn(fname, 0, total_size)
                 downloaded_bytes = 0
+                cancelled        = False
                 with open(fpath, "wb") as f:
                     for chunk in r.iter_content(chunk_size=8192):
+                        if cancel_fn and cancel_fn():
+                            cancelled = True
+                            break
                         if chunk:
                             f.write(chunk)
                             downloaded_bytes += len(chunk)
                             if file_progress_fn:
                                 file_progress_fn(fname, downloaded_bytes, total_size)
+                if cancelled:
+                    _discard_partial(fpath, log_fn)
+                    break
                 if convert_webp and ext == "webp":
                     new_path = _convert_image(fpath, convert_webp)
                     if new_path:
@@ -651,13 +708,20 @@ def download_media(deviations, token, download_dir, media_type="both",
                     if file_progress_fn:
                         file_progress_fn(fname, 0, total_size)
                     downloaded_bytes = 0
+                    cancelled        = False
                     with open(fpath, "wb") as fh:
                         for chunk in r.iter_content(chunk_size=65536):
+                            if cancel_fn and cancel_fn():
+                                cancelled = True
+                                break
                             if chunk:
                                 fh.write(chunk)
                                 downloaded_bytes += len(chunk)
                                 if file_progress_fn:
                                     file_progress_fn(fname, downloaded_bytes, total_size)
+                    if cancelled:
+                        _discard_partial(fpath, log_fn)
+                        break
                     log_fn(f"Saved video: {fname}")
                     videos_ok   += 1
                     bytes_total += downloaded_bytes
@@ -707,7 +771,13 @@ def download_media(deviations, token, download_dir, media_type="both",
                 if progress_fn:
                     progress_fn(done_count, total)
 
-        time.sleep(random.uniform(delay_min, delay_max))
+        # Sleep in slices so Cancel (and closing the window) is honoured promptly
+        # even when a long post delay is configured.
+        deadline = time.monotonic() + random.uniform(delay_min, delay_max)
+        while time.monotonic() < deadline:
+            if cancel_fn and cancel_fn():
+                break
+            time.sleep(max(0.0, min(0.2, deadline - time.monotonic())))
 
     return {"images": images_ok, "videos": videos_ok, "bytes": bytes_total}
 
@@ -715,6 +785,8 @@ def download_media(deviations, token, download_dir, media_type="both",
 # ── CLI entry point ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    handle_reexec_args()
+
     parser = argparse.ArgumentParser(
         description="DeviantArt media downloader",
         formatter_class=argparse.RawDescriptionHelpFormatter,

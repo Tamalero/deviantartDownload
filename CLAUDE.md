@@ -10,11 +10,11 @@ Two entry points: a CLI (`dadownload.py`) and a PyQt6 GUI (`gui.py`).
 - **Python:** system Python 3 (no virtualenv — all deps via pacman)
 - **XDG config:** `~/.config/deviantartdownload/config.ini`
 - **Default output:** `~/Pictures/DeviantArtDownload`
-- **Latest release:** v1.1.0 — https://github.com/Tamalero/deviantartDownload/releases/tag/v1.1.0
+- **Latest release:** v1.2.1 — https://github.com/Tamalero/deviantartDownload/releases/tag/v1.2.1
 
 ---
 
-## Repository state (as of 2026-05-09)
+## Repository state (as of 2026-08-01, updated for v1.2.1)
 
 Git is initialized. Remote is `https://github.com/Tamalero/deviantartDownload.git`, branch `main`.
 
@@ -70,6 +70,7 @@ for Confidential apps.
 | `python-cryptography` | installed |
 | `yt-dlp` | installed |
 | `ffmpeg` | installed |
+| `python-pillow` | installed (Pillow 12.2.0 — used for WebP conversion) |
 
 ### AppImage build dependencies
 
@@ -89,7 +90,7 @@ for Confidential apps.
 python gui.py
 
 # GUI (from AppImage)
-./DeviantArtDownload-1.1.0-x86_64.AppImage
+./DeviantArtDownload-1.2.1-x86_64.AppImage
 
 # CLI — user gallery
 python dadownload.py --mode gallery --user someartist
@@ -116,9 +117,11 @@ Reads `VERSION` dynamically from the `dadownload` module. Full pipeline:
 3. **PyInstaller** (`--onedir --windowed`) with:
    - `--collect-all yt_dlp` — bundles yt-dlp plugin tree
    - `--hidden-import cryptography.fernet` — not auto-detected by PyInstaller
-   - 20 `--exclude-module` flags for heavy unused system packages (torch, torchvision,
-     torchaudio, scipy, numpy, pandas, matplotlib, sympy, PIL, Pillow, sklearn, tensorflow,
+   - 18 `--exclude-module` flags for heavy unused system packages (torch, torchvision,
+     torchaudio, scipy, numpy, pandas, matplotlib, sympy, sklearn, tensorflow,
      keras, jinja2, lxml, gi, pytest, pygments, IPython, ipykernel, notebook)
+   - PIL/Pillow are **not** excluded — Pillow is now actively used for WebP conversion and
+     must be bundled
 4. **Assemble AppDir** — copies PyInstaller onedir output to `AppDir/usr/bin/`; writes
    `AppRun` launcher script; copies `.desktop` entry
 5. **Generate icon** — tries `rsvg-convert` → `inkscape` → `convert` (ImageMagick) → Python
@@ -130,7 +133,12 @@ Reads `VERSION` dynamically from the `dadownload` module. Full pipeline:
    ```
    gh-releases-zsync|Tamalero|deviantartDownload|latest|DeviantArtDownload-*-x86_64.AppImage.zsync
    ```
-   Output: `DeviantArtDownload-<version>-x86_64.AppImage` (~117 MB)
+   Output: `DeviantArtDownload-<version>-x86_64.AppImage` (~126 MB at v1.2.1)
+
+> **Bundle size drifts with the host system.** v1.2.0 was 118 MiB, v1.2.1 is 126 MiB — the
+> delta is system Qt/KDE libraries PyInstaller pulled in via the Qt image plugins
+> (`libKF6BreezeIcons` 25 MB, `libx265` 20 MB, `libaom` 8 MB), not anything in the app code.
+> Check `du -sh DeviantArtDownload.AppDir/usr/bin/_internal/* | sort -rh | head` after a build.
 
 > **Note on PEP 668 (Arch Linux):** system Python blocks `pip install --user pyinstaller`
 > without `--break-system-packages`. Use:
@@ -346,7 +354,7 @@ All functions are importable (no module-level side effects). `__main__` block ha
 
 | Symbol | Purpose |
 |---|---|
-| `VERSION` | Current version string (`"1.1.0"`) |
+| `VERSION` | Current version string (`"1.2.1"`) |
 | `GITHUB_REPO` | `"Tamalero/deviantartDownload"` — used by update checker and About dialog |
 | `_GITHUB_API` | GitHub Releases API URL constructed from `GITHUB_REPO` |
 | `CONFIG_FILE` | `Path` to `~/.config/deviantartdownload/config.ini` |
@@ -358,6 +366,7 @@ All functions are importable (no module-level side effects). `__main__` block ha
 | `GALLERY_URL` | `https://www.deviantart.com/api/v1/oauth2/gallery/all` |
 | `FAVOURITES_URL` | `https://www.deviantart.com/api/v1/oauth2/collections/all` |
 | `DOWNLOAD_URL` | `https://www.deviantart.com/api/v1/oauth2/deviation/download` |
+| `handle_reexec_args()` | Frozen-build guard — exits (running the requested `-c` code first) when the process is a Python re-exec rather than a real launch. Called first in `gui.main()` and in the CLI `__main__`. No-op when not frozen. See "Duplicate GUI windows" below |
 | `load_config()` | Reads full config (credentials + last_run sections) |
 | `save_config(id, secret)` | Read-modify-write; encrypts client_secret before storing |
 | `save_ui_state(dict)` | Writes `[last_run]` section without touching credentials |
@@ -375,6 +384,7 @@ All functions are importable (no module-level side effects). `__main__` block ha
 | `format_timestamp(unix_ts)` | Unix timestamp → `YYYYMMDD_HHMMSS` string |
 | `_image_ext_from_url(url)` | Best-effort extension from CDN URL path |
 | `_best_video_url(videos)` | Pick highest-quality entry from deviation `videos` array → `(url, filesize)` or `None`; used to bypass yt-dlp for direct CDN streaming |
+| `_convert_image(src_path, target_ext)` | Open image with Pillow; convert RGBA/LA/P to RGB for JPEG targets; save as PNG or JPEG (quality=95); return new path or `None` on failure |
 | `_deviation_media_type(dev)` | Infer `"image"` / `"film"` / `""` from deviation fields (`content`, `videos`, `is_downloadable`) — DA API does not send a `type` field |
 | `_version_tuple(v)` | Split version string → `tuple[int, ...]` for comparison |
 | `check_for_update()` | GET GitHub Releases API → `(tag, url)` or `(None, None)` |
@@ -382,6 +392,7 @@ All functions are importable (no module-level side effects). `__main__` block ha
 | `fetch_user_gallery(token, username, ...)` | Wraps `_fetch_feed` → `gallery/all` |
 | `fetch_user_favourites(token, username, ...)` | Wraps `_fetch_feed` → `collections/all` |
 | `_get_deviation_download_url(token, id)` | Calls `/deviation/download/{id}`; returns `(url, ext)` or `None` |
+| `_discard_partial(path, log_fn)` | Deletes a half-written file after a mid-stream cancel — a truncated file would otherwise be treated as complete by the "already exists" skip on every later run |
 | `_download_video(url, output_template)` | Fallback: downloads via `yt_dlp` Python API using the deviation page URL (only called when `videos` array has no `src`) |
 | `download_media(deviations, token, dir, ...)` | Downloads images (streaming) and videos (direct CDN streaming via `_best_video_url`, yt-dlp fallback); returns stats dict |
 
@@ -391,7 +402,7 @@ All functions are importable (no module-level side effects). `__main__` block ha
 def download_media(deviations, token, download_dir, media_type="both",
                    log_fn=print, error_fn=None, cancel_fn=None,
                    progress_fn=None, file_progress_fn=None, preview_fn=None,
-                   delay_min=0.5, delay_max=2.0):
+                   delay_min=0.5, delay_max=2.0, convert_webp=None):
 ```
 
 **Return value:** `{"images": N, "videos": N, "bytes": N}` — partial stats also returned on cancel.
@@ -402,12 +413,13 @@ def download_media(deviations, token, download_dir, media_type="both",
 |---|---|---|
 | `log_fn` | `str → None` | Normal log messages (default: `print`) |
 | `error_fn` | `str → None` | Per-file error messages; defaults to `log_fn` |
-| `cancel_fn` | `() → bool` | Download stops when this returns `True` |
+| `cancel_fn` | `() → bool` | Download stops when this returns `True`. Checked between deviations, **per chunk while streaming**, and during the post delay — so a cancel takes effect in well under a second even on a large file or a 60 s delay. A file interrupted mid-stream is deleted via `_discard_partial`, never left truncated |
 | `progress_fn` | `(int, int) → None` | Called with `(done_count, total_count)` after each file |
 | `file_progress_fn` | `(str, int, int) → None` | Called with `(filename, bytes_done, bytes_total)` during streaming |
 | `preview_fn` | `str → None` | Called with the saved file path after each successful download |
 | `delay_min` | `float` | Minimum seconds between deviations (default: 0.5) |
 | `delay_max` | `float` | Maximum seconds between deviations (default: 2.0) |
+| `convert_webp` | `str \| None` | If `"png"` or `"jpg"`, WebP images are converted after download via `_convert_image`; original `.webp` file is removed; `None` means no conversion |
 
 Sleep uses `random.uniform(delay_min, delay_max)` — when min == max this is a fixed delay.
 
@@ -432,7 +444,7 @@ the Download Options group.
 
 #### `decrypt_password` — key-loss safety
 
-Same pattern as BlueSkyDownload:
+Key-loss-safe decryption with three cases:
 1. Valid Fernet token + correct key → returns plaintext
 2. Looks like Fernet token (`startswith("gAAAAA")`) but decryption fails → returns `None`
 3. Does not look like Fernet → returns token unchanged (legacy plaintext migration path)
@@ -455,7 +467,17 @@ Imports `dadownload as da`. No logic lives here — only UI wiring.
 | `file_progress` | `(str, int, int)` | `(filename, bytes_done, bytes_total)` for file bar |
 | `preview` | `str` | File path of the latest successfully saved file |
 
-`cancel()` sets `self._stop = True`; `download_media` checks it between deviations via `cancel_fn`.
+`cancel()` sets `self._stop = True`; `download_media` checks it via `cancel_fn` between
+deviations, per chunk while streaming, and during the post delay.
+
+#### `closeEvent` — thread shutdown
+
+`MainWindow.closeEvent` stops `_auth_timer`, then for every still-running worker
+(`worker`, `_auth_worker`, `_update_checker`, `_manual_checker`): `blockSignals(True)`,
+`cancel()` on the download worker, `wait(3000)`, and `terminate()` + `wait(1000)` as a last
+resort. Without this a QThread outliving its window aborts the process with
+*"QThread: Destroyed while thread is still running"*. `AuthWorker` is the case that can need
+terminating — it parks in the OAuth callback server for up to 120 s and has no cooperative stop.
 
 After `download_media` returns, the worker emits a summary line:
 ```
@@ -530,14 +552,14 @@ StatusBar              (left: messages, right: update link label — hidden unti
 | Username | `QLineEdit` | Placeholder: `e.g.  tamalero  (username only, no URL)` |
 | Media Type | `QComboBox` | "Both" \| "Images Only" \| "Videos Only" |
 | Max Pages | `QSpinBox` | 1–200, default 25, suffix `  pages  (~24 deviations each)` |
-| Post Delay | composite widget | Fixed/Variable spinboxes (same as BlueSkyDownload) |
+| Post Delay | composite widget | Fixed/Variable spinboxes (see Post Delay widget below) |
+| WebP images | `QCheckBox` + `QComboBox` | `chk_convert_webp` enables conversion; `cb_convert_webp_fmt` selects "PNG" or "JPG" (width 68 px, disabled until checkbox checked); persisted to `[last_run]` |
 | Verbose | `QCheckBox` | "Show detailed API output (for debugging)" |
 
 `verbose` is not persisted to `[last_run]` — it defaults to unchecked on every launch.
 
 #### Post Delay widget
 
-Identical to BlueSkyDownload:
 - `cb_delay_type`: "Fixed" | "Variable"
 - Fixed mode: `dsb_delay_fixed` (0–60 s, default 1.0 s)
 - Variable mode: `dsb_delay_min` (default 0.5 s) + `dsb_delay_max` (default 2.0 s)
@@ -568,7 +590,8 @@ Identical to BlueSkyDownload:
   (Fernet-encrypted), `refresh_token` (Fernet-encrypted), `token_expires_at` (plaintext unix
   timestamp) — credentials saved on Authorize/Start; token fields saved by `da.save_token()`
 - `[last_run]`: `mode`, `username`, `media`, `pages`, `output`, `delay_type`, `delay_fixed`,
-  `delay_min`, `delay_max` — saved on Start; `verbose` is NOT persisted
+  `delay_min`, `delay_max`, `convert_webp` (bool as `"true"`/`"false"`), `convert_webp_fmt`
+  (`"PNG"` or `"JPG"`) — saved on Start; `verbose` is NOT persisted
 - Both sections use read-modify-write via `save_config` / `save_ui_state`
 
 #### Splitter ratio — screen-responsive
@@ -602,6 +625,43 @@ Identical to BlueSkyDownload:
 
 ---
 
+## Duplicate GUI windows in the AppImage (bug in ≤ v1.2.0, fixed in v1.2.1)
+
+**Symptom:** running the AppImage, a second identical GUI window appeared on its own —
+once during a session, and once more when the main window was closed. The extra window was
+inert; closing it left the app working normally.
+
+**Cause:** `tqdm` builds its default write lock from `multiprocessing.RLock()`. Creating that
+lock opens a POSIX semaphore, which makes `multiprocessing.resource_tracker.ensure_running()`
+launch its helper process as:
+
+```
+sys.executable -B -S -I -c 'from multiprocessing.resource_tracker import main;main(<fd>)'
+```
+
+Under PyInstaller `sys.executable` **is** the app binary, and the bootloader discards
+interpreter arguments — so the "helper" starts as a full second GUI. It never runs the tracker
+loop, so once that window is closed `_check_alive()` fails and the *next* `register`/
+`unregister` relaunches it — which is what the SemLock finalizer does at interpreter shutdown,
+producing the second window on exit. Only reproducible frozen; from source `sys.executable`
+is `python3` and the re-exec is harmless.
+
+**Fix (two layers):**
+
+1. `dadownload.py` calls `tqdm.set_lock(threading.RLock())` at import, before the first
+   `tqdm()` call — no semaphore, so multiprocessing is never started. Progress bars are
+   unaffected (the app is single-process).
+2. `handle_reexec_args()` runs first in `gui.main()` / CLI `__main__`: if the frozen binary is
+   started with interpreter-style arguments it executes the requested `multiprocessing` code
+   and exits instead of building a window. Covers any future re-exec (e.g. yt-dlp or a new
+   dependency touching multiprocessing).
+
+Regression check — build a throwaway `--onedir --windowed` PyInstaller binary that constructs a
+`tqdm` the way `_fetch_feed` does and logs `os.getpid()`/`sys.argv` at startup; exactly one
+process must appear, and no `resource_tracker: process died unexpectedly` warning.
+
+---
+
 ## Known limitations / open issues
 
 - **Token expiry / refresh:** access tokens expire after ~1 hour. The GUI refreshes automatically
@@ -623,7 +683,16 @@ Identical to BlueSkyDownload:
 - **Private content:** the auth code token grants access to the authenticated user's own private
   deviations/collections if they are the target username. Other users' private content remains
   inaccessible.
-- **No cross-run dedup:** skips files if the output filename already exists on disk.
+- **WebP images:** DA frequently serves images as WebP. The GUI "WebP images" toggle converts
+  them to PNG or JPG post-download using Pillow. Conversion is applied after the CT-corrected
+  extension is known, so it catches WebP regardless of how the extension was determined.
+  Pillow is bundled in the AppImage; conversion requires no extra install from source.
+- **No cross-run dedup:** skips files if the output filename already exists on disk. Partial
+  files are deleted on cancel so this skip never sees a truncated download.
+- **Timestamps:** `format_timestamp` uses `datetime.fromtimestamp(ts, tz=timezone.utc)`.
+  It previously used `datetime.utcfromtimestamp`, deprecated since Python 3.12 — under
+  `-W error` the broad `except` turned every filename into `unknown_date`. Output is
+  byte-identical to the old implementation, so existing downloads still dedup correctly.
 - **Literature/Flash:** silently skipped (not downloaded).
 - **AppImage size:** ~117 MB after excluding heavy system packages from PyInstaller. If new
   system packages are installed globally that trigger PyInstaller hooks, the bundle can grow;
@@ -633,21 +702,21 @@ Identical to BlueSkyDownload:
 
 ---
 
-## Differences from BlueSkyDownload
+## Design characteristics
 
-| Aspect | BlueSkyDownload | DeviantArtDownload |
-|---|---|---|
-| Auth | Handle + App Password (AT Protocol) | Client ID + Client Secret + OAuth2 Authorization Code + PKCE (user browser login) |
-| Core module | `apitest.py` | `dadownload.py` |
-| Mode 1 | Liked Posts | User Favourites |
-| Mode 2 | User Gallery | User Gallery |
-| Target field | Optional (blank = own account) | Required (DA API always needs a username) |
-| Page size | 50 posts | 24 deviations (DA API max) |
-| Pagination | Cursor-based | Offset-based (`has_more` + `next_offset`) |
-| Images | CDN `fullsize` URL | Full-res via `/deviation/download`, fallback to `content.src` |
-| Videos | HLS playlist via yt-dlp | Direct CDN streaming from `dev.videos[].src` (highest quality); yt-dlp fallback |
-| Config dir | `~/.config/blueskydownload/` | `~/.config/deviantartdownload/` |
-| Default output | `~/Pictures/BlueSkyDownload` | `~/Pictures/DeviantArtDownload` |
-| Update checker | Yes (GitHub Releases API) | Yes — GUI (Help menu + status bar) + `check_for_update()` in CLI module |
-| AppImage | No | Yes — `build_appimage.sh`, published at v1.1.0 |
-| Verbose mode | No | Yes (checkbox + `--verbose` CLI flag) |
+| Aspect | DeviantArtDownload |
+|---|---|
+| Auth | Client ID + Client Secret + OAuth2 Authorization Code + PKCE (user browser login) |
+| Core module | `dadownload.py` |
+| Mode 1 | User Favourites |
+| Mode 2 | User Gallery |
+| Target field | Required (DA API always needs a username) |
+| Page size | 24 deviations (DA API max) |
+| Pagination | Offset-based (`has_more` + `next_offset`) |
+| Images | Full-res via `/deviation/download`, fallback to `content.src` |
+| Videos | Direct CDN streaming from `dev.videos[].src` (highest quality); yt-dlp fallback |
+| Config dir | `~/.config/deviantartdownload/` |
+| Default output | `~/Pictures/DeviantArtDownload` |
+| Update checker | GUI (Help menu + status bar) + `check_for_update()` in CLI module |
+| AppImage | Yes — `build_appimage.sh`, published at v1.2.1 |
+| Verbose mode | Yes (checkbox + `--verbose` CLI flag) |

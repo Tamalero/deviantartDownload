@@ -13,11 +13,13 @@ Available as a **PyQt6 GUI** and a **command-line tool**.
 - **Videos** — direct CDN streaming from the deviation's embedded video URL
 - OAuth2 Authorization Code + PKCE login — authenticates as your DA account, enabling mature content access
 - Automatic token refresh (re-login only needed when refresh token expires)
+- **WebP → PNG/JPG conversion** — DeviantArt often serves WebP; convert on download
 - Configurable post-delay between downloads (fixed or random range)
 - File progress bar per download and overall progress counter
 - In-app image preview after each save
 - Auth status countdown (turns yellow → red as expiry approaches)
 - Update checker via GitHub Releases API
+- **Cancel stops immediately**, even mid-file — the partial file is discarded, not left behind
 
 ---
 
@@ -30,6 +32,7 @@ Available as a **PyQt6 GUI** and a **command-line tool**.
 | `python-pyqt6` | `sudo pacman -S python-pyqt6` |
 | `python-cryptography` | `sudo pacman -S python-cryptography` |
 | `python-tqdm` | `sudo pacman -S python-tqdm` |
+| `python-pillow` | `sudo pacman -S python-pillow` (WebP conversion) |
 | `yt-dlp` | `sudo pacman -S yt-dlp` |
 | `ffmpeg` | `sudo pacman -S ffmpeg` |
 
@@ -44,8 +47,8 @@ Available as a **PyQt6 GUI** and a **command-line tool**.
 Download `DeviantArtDownload-<version>-x86_64.AppImage` from the [latest release](https://github.com/Tamalero/deviantartDownload/releases/latest), make it executable, and run:
 
 ```bash
-chmod +x DeviantArtDownload-1.1.0-x86_64.AppImage
-./DeviantArtDownload-1.1.0-x86_64.AppImage
+chmod +x DeviantArtDownload-1.2.1-x86_64.AppImage
+./DeviantArtDownload-1.2.1-x86_64.AppImage
 ```
 
 > `ffmpeg` must still be installed on the host system — it is **not** bundled in the AppImage.
@@ -105,6 +108,7 @@ Launch the app (AppImage or `python gui.py`), fill in your credentials, select a
 | Media Type | Both / Images Only / Videos Only |
 | Max Pages | How many pages to scan (24 deviations per page) |
 | Post Delay | Pause between downloads — Fixed or random Variable range |
+| WebP images | Convert downloaded WebP files to PNG or JPG |
 | Output Folder | Where files are saved (default: `~/Pictures/DeviantArtDownload`) |
 
 ### CLI
@@ -165,7 +169,7 @@ These files are **not** committed — they are covered by `.gitignore`.
 - **Literature and Flash deviations** are silently skipped (not downloadable via the API).
 - **Private content** — the token gives access to the authenticated user's own private deviations/collections only. Other users' private content remains inaccessible.
 - **Cross-run deduplication** is filename-based only; the same file downloaded under a different name will be re-downloaded.
-- **AppImage size** is ~116 MB (Python + Qt6 runtime). `ffmpeg` is not bundled; install it separately.
+- **AppImage size** is ~126 MB (Python + Qt6 runtime). `ffmpeg` is not bundled; install it separately.
 
 ---
 

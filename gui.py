@@ -389,6 +389,28 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         self._rescale_preview()
 
+    def closeEvent(self, event):
+        """Stop background threads before the widgets their signals target are gone.
+
+        A QThread still running when its MainWindow is destroyed aborts the process with
+        "QThread: Destroyed while thread is still running"."""
+        self._auth_timer.stop()
+
+        for worker in (self.worker, self._auth_worker,
+                       self._update_checker, self._manual_checker):
+            if worker is None or not worker.isRunning():
+                continue
+            worker.blockSignals(True)      # nothing left to deliver signals to
+            if worker is self.worker:
+                worker.cancel()            # checked per chunk, so this returns quickly
+            if not worker.wait(3000):
+                # AuthWorker can sit in the OAuth callback server for up to 120 s with no
+                # cooperative stop. The process is exiting anyway.
+                worker.terminate()
+                worker.wait(1000)
+
+        super().closeEvent(event)
+
     def _apply_splitter_ratio(self):
         screen   = QApplication.primaryScreen()
         screen_h = screen.size().height() if screen else 1080
@@ -792,6 +814,9 @@ class MainWindow(QMainWindow):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
+    # Must come first: a frozen re-exec must never reach QApplication.
+    da.handle_reexec_args()
+
     app = QApplication(sys.argv)
     app.setApplicationName("DeviantArt Downloader")
     window = MainWindow()
